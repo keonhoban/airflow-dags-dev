@@ -3,6 +3,9 @@
 import mlflow
 from ml_code.config import get_mlflow_client
 from mlflow.exceptions import MlflowException
+from airflow.utils.log.logging_mixin import LoggingMixin
+
+logger = LoggingMixin().log
 
 def rollback_model(model_name: str, version: str, alias: str):
     try:
@@ -24,10 +27,10 @@ def rollback_model(model_name: str, version: str, alias: str):
         client.delete_registered_model_alias(model_name, alias)
         client.set_registered_model_alias(model_name, alias, version)
 
-        print(f"[Rollback] 성공: @{alias} → v{version}")
+        logger.info(f"[Rollback] 성공: @{alias} → v{version}")
 
     except MlflowException as e:
         raise RuntimeError(f"[Rollback Error] MLflow 예외 발생: {e}") from e
     except Exception as e:
-        print(f"[Rollback Error] {e}")
+        logger.error(f"[Rollback Error] {e}")
         raise
