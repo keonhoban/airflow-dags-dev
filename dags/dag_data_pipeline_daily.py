@@ -18,7 +18,6 @@ from ml_code.data_pipeline import (
     summarize_run,
 )
 
-# KST 타임존
 kst = timezone("Asia/Seoul")
 
 default_args = {
@@ -27,42 +26,29 @@ default_args = {
     "retry_delay": timedelta(minutes=3),
 }
 
-
-def _get_pipeline_config(context):
+def _get_pipeline_config():
     """
-    실행 시점(context)을 받아서 S3 경로를 동적으로 생성합니다.
-    👉 여기서는 템플릿 문자열({{ ds_nodash }})을 쓰지 않습니다.
-
-    - RAW 버킷:    datapipeline-raw-data-keonho
-    - FEATURE 버킷: datapipeline-feature-data-keonho
-
-    파일명 규칙:
-      user_events_<ds_nodash>.csv
-      user_events_feat_<ds_nodash>.csv
+    건호님이 실제 업로드한 S3 파일을 기본값으로 사용하는 구성.
     """
-    ds_nodash = context["ds_nodash"]  # 예: 20251119
+    try:
+        raw_path = Variable.get(
+            "dp_raw_path",
+            default_var="s3://datapipeline-raw-data-keonho/user_events_20251119.csv"
+        )
 
-    # Variable에서 버킷/프리픽스를 바꿀 수 있게 해둠 (없으면 기본값 사용)
-    raw_bucket = Variable.get("dp_raw_bucket", default_var="datapipeline-raw-data-keonho")
-    raw_prefix = Variable.get("dp_raw_prefix", default_var="")  # 예: "daily"
-    feat_bucket = Variable.get("dp_feature_bucket", default_var="datapipeline-feature-data-keonho")
-    feat_prefix = Variable.get("dp_feature_prefix", default_var="daily")
+        feature_path = Variable.get(
+            "dp_feature_path",
+            default_var="s3://datapipeline-raw-data-keonho/features/user_events_feat_20251119.csv"
+        )
 
-    def build_s3_uri(bucket, prefix, filename):
-        prefix = prefix.strip("/")
-        if prefix:
-            key = f"{prefix}/{filename}"
-        else:
-            key = filename
-        return f"s3://{bucket}/{key}"
-
-    raw_filename = f"user_events_{ds_nodash}.csv"
-    feat_filename = f"user_events_feat_{ds_nodash}.csv"
-
-    raw_path = build_s3_uri(raw_bucket, raw_prefix, raw_filename)
-    feature_path = build_s3_uri(feat_bucket, feat_prefix, feat_filename)
-
-    pipeline_name = Variable.get("dp_pipeline_name", default_var="daily_user_events")
+        pipeline_name = Variable.get(
+            "dp_pipeline_name",
+            default_var="daily_user_events"
+        )
+    except Exception:
+        raw_path = "s3://datapipeline-raw-data-keonho/user_events_20251119.csv"
+        feature_path = "s3://datapipeline-raw-data-keonho/features/user_events_feat_20251119.csv"
+        pipeline_name = "daily_user_events"
 
     return {
         "raw_path": raw_path,
@@ -70,27 +56,28 @@ def _get_pipeline_config(context):
         "pipeline_name": pipeline_name,
     }
 
+# --------------------------
+# Task Wrappers
+# --------------------------
 
 def task_extract_raw_data(**context):
-    cfg = _get_pipeline_config(context)
+    cfg = _get_pipeline_config()
     extract_raw_data(
         raw_path=cfg["raw_path"],
         pipeline_name=cfg["pipeline_name"],
         ti=context["ti"],
     )
 
-
 def task_validate_data(**context):
-    cfg = _get_pipeline_config(context)
+    cfg = _get_pipeline_config()
     validate_data(
         raw_path=cfg["raw_path"],
         pipeline_name=cfg["pipeline_name"],
         ti=context["ti"],
     )
 
-
 def task_build_features(**context):
-    cfg = _get_pipeline_config(context)
+    cfg = _get_pipeline_config()
     build_features(
         raw_path=cfg["raw_path"],
         feature_path=cfg["feature_path"],
@@ -98,31 +85,27 @@ def task_build_features(**context):
         ti=context["ti"],
     )
 
-
 def task_store_features(**context):
-    cfg = _get_pipeline_config(context)
+    cfg = _get_pipeline_config()
     store_features(
         feature_path=cfg["feature_path"],
         pipeline_name=cfg["pipeline_name"],
         ti=context["ti"],
     )
 
-
 def task_summarize_run(**context):
-    cfg = _get_pipeline_config(context)
+    cfg = _get_pipeline_config()
     summarize_run(
         pipeline_name=cfg["pipeline_name"],
         ti=context["ti"],
     )
 
-
 with DAG(
     dag_id="data_pipeline_daily_dev",
     default_args=default_args,
-    schedule="0 3 * * *",  # 매일 새벽 3시
+    schedule=None,  # ✔ 수동 실행
     catchup=False,
     tags=["data-pipeline", "dev", "mlops"],
-    description="데일리 데이터 파이프라인 (raw → validate → feature → store)",
     on_failure_callback=alert_slack,
 ) as dag:
 
@@ -149,7 +132,7 @@ with DAG(
     t_summary = PythonOperator(
         task_id="summarize_run",
         python_callable=task_summarize_run,
-        trigger_rule=TriggerRule.ALL_DONE,
+        trigger_rule=TriggerRule.ALL_DONE
     )
 
     t_extract >> t_validate >> t_build >> t_store >> t_summary
