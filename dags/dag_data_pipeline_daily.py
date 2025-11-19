@@ -46,7 +46,7 @@ def _get_pipeline_config():
             default_var="daily_user_events"
         )
     except Exception:
-        raw_path = "s3://datapipeline-raw-data-keonho/user_events_20251119.csv"
+        raw_path = "s3://datapipeline-raw-data-keonho/daily/user_events_20251119.csv"
         feature_path = "s3://datapipeline-raw-data-keonho/features/user_events_feat_20251119.csv"
         pipeline_name = "daily_user_events"
 
