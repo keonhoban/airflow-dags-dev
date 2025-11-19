@@ -33,7 +33,7 @@ def _get_pipeline_config():
     try:
         raw_path = Variable.get(
             "dp_raw_path",
-            default_var="s3://datapipeline-raw-data-keonho/user_events_20251119.csv"
+            default_var="s3://datapipeline-raw-data-keonho/daily/user_events_20251119.csv"
         )
 
         feature_path = Variable.get(
