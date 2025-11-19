@@ -9,7 +9,7 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from airflow.sdk import Variable
 
-from utils.slack_alerts import alert_slack, send_slack_alert
+from utils.slack_alerts import alert_slack
 from ml_code.data_pipeline import (
     extract_raw_data,
     validate_data,
@@ -28,37 +28,41 @@ default_args = {
 }
 
 
-def _get_pipeline_config():
+def _get_pipeline_config(context):
     """
-    파이프라인 설정 로딩:
-      - dp_raw_path      : RAW 데이터 S3 경로
-      - dp_feature_path  : Feature S3 경로
-      - dp_pipeline_name : 파이프라인 이름
+    실행 시점(context)을 받아서 S3 경로를 동적으로 생성합니다.
+    👉 여기서는 템플릿 문자열({{ ds_nodash }})을 쓰지 않습니다.
 
-    Airflow Variable에 없으면 기본값 사용.
+    - RAW 버킷:    datapipeline-raw-data-keonho
+    - FEATURE 버킷: datapipeline-feature-data-keonho
 
-    기본값 예시:
-      RAW:     s3://datapipeline-raw-data-keonho/daily/user_events_{{ ds_nodash }}.csv
-      FEATURE: s3://datapipeline-feature-data-keonho/daily/user_events_feat_{{ ds_nodash }}.csv
+    파일명 규칙:
+      user_events_<ds_nodash>.csv
+      user_events_feat_<ds_nodash>.csv
     """
-    try:
-        raw_path = Variable.get(
-            "dp_raw_path",
-            default_var="s3://datapipeline-raw-data-keonho/daily/user_events_{{ ds_nodash }}.csv",
-        )
-        feature_path = Variable.get(
-            "dp_feature_path",
-            default_var="s3://datapipeline-feature-data-keonho/daily/user_events_feat_{{ ds_nodash }}.csv",
-        )
-        pipeline_name = Variable.get(
-            "dp_pipeline_name",
-            default_var="daily_user_events",
-        )
-    except Exception:
-        # Variable에서 뭔가 문제가 생겨도 DAG는 돌아가도록 기본값 사용
-        raw_path = "s3://datapipeline-raw-data-keonho/daily/user_events_{{ ds_nodash }}.csv"
-        feature_path = "s3://datapipeline-feature-data-keonho/daily/user_events_feat_{{ ds_nodash }}.csv"
-        pipeline_name = "daily_user_events"
+    ds_nodash = context["ds_nodash"]  # 예: 20251119
+
+    # Variable에서 버킷/프리픽스를 바꿀 수 있게 해둠 (없으면 기본값 사용)
+    raw_bucket = Variable.get("dp_raw_bucket", default_var="datapipeline-raw-data-keonho")
+    raw_prefix = Variable.get("dp_raw_prefix", default_var="")  # 예: "daily"
+    feat_bucket = Variable.get("dp_feature_bucket", default_var="datapipeline-feature-data-keonho")
+    feat_prefix = Variable.get("dp_feature_prefix", default_var="daily")
+
+    def build_s3_uri(bucket, prefix, filename):
+        prefix = prefix.strip("/")
+        if prefix:
+            key = f"{prefix}/{filename}"
+        else:
+            key = filename
+        return f"s3://{bucket}/{key}"
+
+    raw_filename = f"user_events_{ds_nodash}.csv"
+    feat_filename = f"user_events_feat_{ds_nodash}.csv"
+
+    raw_path = build_s3_uri(raw_bucket, raw_prefix, raw_filename)
+    feature_path = build_s3_uri(feat_bucket, feat_prefix, feat_filename)
+
+    pipeline_name = Variable.get("dp_pipeline_name", default_var="daily_user_events")
 
     return {
         "raw_path": raw_path,
@@ -68,7 +72,7 @@ def _get_pipeline_config():
 
 
 def task_extract_raw_data(**context):
-    cfg = _get_pipeline_config()
+    cfg = _get_pipeline_config(context)
     extract_raw_data(
         raw_path=cfg["raw_path"],
         pipeline_name=cfg["pipeline_name"],
@@ -77,7 +81,7 @@ def task_extract_raw_data(**context):
 
 
 def task_validate_data(**context):
-    cfg = _get_pipeline_config()
+    cfg = _get_pipeline_config(context)
     validate_data(
         raw_path=cfg["raw_path"],
         pipeline_name=cfg["pipeline_name"],
@@ -86,7 +90,7 @@ def task_validate_data(**context):
 
 
 def task_build_features(**context):
-    cfg = _get_pipeline_config()
+    cfg = _get_pipeline_config(context)
     build_features(
         raw_path=cfg["raw_path"],
         feature_path=cfg["feature_path"],
@@ -96,7 +100,7 @@ def task_build_features(**context):
 
 
 def task_store_features(**context):
-    cfg = _get_pipeline_config()
+    cfg = _get_pipeline_config(context)
     store_features(
         feature_path=cfg["feature_path"],
         pipeline_name=cfg["pipeline_name"],
@@ -105,7 +109,7 @@ def task_store_features(**context):
 
 
 def task_summarize_run(**context):
-    cfg = _get_pipeline_config()
+    cfg = _get_pipeline_config(context)
     summarize_run(
         pipeline_name=cfg["pipeline_name"],
         ti=context["ti"],
@@ -145,7 +149,7 @@ with DAG(
     t_summary = PythonOperator(
         task_id="summarize_run",
         python_callable=task_summarize_run,
-        trigger_rule=TriggerRule.ALL_DONE,  # 중간에 실패해도 요약은 시도
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     t_extract >> t_validate >> t_build >> t_store >> t_summary

@@ -1,10 +1,10 @@
 # ml_code/data_pipeline.py
 
 import io
+import csv
 from urllib.parse import urlparse
 
 import boto3
-import pandas as pd
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 logger = LoggingMixin().log
@@ -43,7 +43,6 @@ def extract_raw_data(raw_path: str, pipeline_name: str, ti):
     """
     ✅ Step 1: RAW 데이터 수집 (S3 기준)
     - 이 단계에서는 'S3에 오늘자 RAW 파일이 존재하는지' 확인만 합니다.
-    - 필요하다면 외부 버킷 → 내부 버킷 copy 로직을 넣을 수도 있습니다.
     """
     s3 = _get_s3_client()
     bucket, key = _parse_s3_uri(raw_path)
@@ -75,6 +74,7 @@ def validate_data(raw_path: str, pipeline_name: str, ti):
     """
     ✅ Step 2: 데이터 검증
     - S3에서 CSV를 읽어서 row 수, null 비율 등을 계산합니다.
+    - pandas 없이 csv 모듈로 처리해서 의존성을 줄였습니다.
     """
     s3 = _get_s3_client()
     bucket, key = _parse_s3_uri(raw_path)
@@ -88,15 +88,26 @@ def validate_data(raw_path: str, pipeline_name: str, ti):
 
     obj = s3.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
+    text = body.decode("utf-8")
 
-    # CSV 기준 예시
-    df = pd.read_csv(io.BytesIO(body))
+    reader = csv.reader(io.StringIO(text))
+    rows = 0
+    null_count = 0
+    total_cells = 0
 
-    rows = len(df)
-    total_cells = df.shape[0] * df.shape[1] if rows > 0 else 0
-    null_count = int(df.isna().sum().sum())
+    header = None
+    for i, row in enumerate(reader):
+        if i == 0:
+            header = row
+            continue
+        rows += 1
+        total_cells += len(row)
+        for cell in row:
+            # 빈 문자열을 null로 간주
+            if cell == "":
+                null_count += 1
+
     null_rate = (null_count / total_cells) if total_cells > 0 else 0.0
-
     valid = True
     # 간단한 룰 예시: 전체 행이 1 이상이고, null_rate < 0.5
     if rows == 0 or null_rate > 0.5:
@@ -132,52 +143,85 @@ def validate_data(raw_path: str, pipeline_name: str, ti):
 def build_features(raw_path: str, feature_path: str, pipeline_name: str, ti):
     """
     ✅ Step 3: Feature 가공
-    - 다시 S3에서 raw 데이터를 읽어와 간단한 가공을 수행합니다.
-    - 여기서는 예시로 numeric 컬럼만 남기고,
-      간단한 파생 컬럼(row_sum)을 추가합니다.
+    - 예시로 event_value, amount, session_length_sec 같은 숫자형 컬럼만 뽑아서
+      합산 컬럼(row_sum)을 추가하는 구조를 가정합니다.
+    - 여기서는 단순화를 위해 CSV 파싱 후,
+      숫자 변환이 가능한 컬럼들만 사용합니다.
     """
     s3 = _get_s3_client()
-    raw_bucket, raw_key = _parse_s3_uri(raw_path)
+    bucket, key = _parse_s3_uri(raw_path)
 
     logger.info(
         "[DP] pipeline=%s step=build_features action=get_object bucket=%s key=%s",
         pipeline_name,
-        raw_bucket,
-        raw_key,
+        bucket,
+        key,
     )
 
-    obj = s3.get_object(Bucket=raw_bucket, Key=raw_key)
+    obj = s3.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
+    text = body.decode("utf-8")
 
-    df = pd.read_csv(io.BytesIO(body))
+    reader = csv.reader(io.StringIO(text))
+    header = None
+    rows = []
 
-    # 숫자형 컬럼만 남기기
-    num_df = df.select_dtypes(include=["number"]).copy()
+    for i, row in enumerate(reader):
+        if i == 0:
+            header = row
+            continue
+        rows.append(row)
 
-    # 간단한 파생 컬럼: 각 행의 숫자 합
-    if not num_df.empty:
-        num_df["row_sum"] = num_df.sum(axis=1)
-    else:
-        num_df["row_sum"] = 0
+    if not header:
+        raise ValueError("[DP] 헤더가 없는 CSV입니다.")
 
-    feature_rows = len(num_df)
+    # 숫자형으로 쓸 후보 컬럼 이름들 (user_events 예시 기준)
+    numeric_candidates = {"user_id", "is_premium", "event_value", "amount", "session_length_sec"}
+
+    # header 기준으로 어떤 인덱스가 numeric 후보인지 결정
+    numeric_indices = [
+        idx for idx, col in enumerate(header) if col in numeric_candidates
+    ]
+
+    feature_rows = []
+
+    for row in rows:
+        numeric_values = []
+        for idx in numeric_indices:
+            if idx >= len(row):
+                continue
+            cell = row[idx]
+            if cell == "":
+                # 빈 값은 0으로 처리
+                numeric_values.append(0.0)
+            else:
+                try:
+                    numeric_values.append(float(cell))
+                except ValueError:
+                    numeric_values.append(0.0)
+
+        row_sum = sum(numeric_values)
+        # 간단히: row_sum 하나만 있는 Feature row로 구성 (필요하면 더 확장 가능)
+        feature_rows.append([row_sum])
 
     logger.info(
         "[DP] pipeline=%s step=build_features status=success rows_in=%d rows_out=%d feature_path=%s",
         pipeline_name,
-        len(df),
-        feature_rows,
+        len(rows),
+        len(feature_rows),
         feature_path,
     )
 
-    # 다음 step에서 저장을 위해 df 전체를 XCom에 직접 싣기보다,
-    # CSV 문자열로 변환해서 넣습니다. (소규모 데이터 기준 예시)
+    # Feature CSV를 위한 헤더 + 데이터 구성
+    feature_header = ["row_sum"]
     buf = io.StringIO()
-    num_df.to_csv(buf, index=False)
+    writer = csv.writer(buf)
+    writer.writerow(feature_header)
+    writer.writerows(feature_rows)
     feature_csv = buf.getvalue()
 
     ti.xcom_push(key="dp_feature_csv", value=feature_csv)
-    ti.xcom_push(key="dp_feature_rows", value=feature_rows)
+    ti.xcom_push(key="dp_feature_rows", value=len(feature_rows))
     ti.xcom_push(key="dp_feature_path", value=feature_path)
 
 
