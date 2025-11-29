@@ -1,4 +1,4 @@
-# dags/dag_data_pipeline_daily.py
+# dags/dag_data_pipeline_daily_v2.py
 
 from datetime import datetime, timedelta
 from pendulum import timezone
@@ -10,7 +10,7 @@ from airflow.utils.trigger_rule import TriggerRule
 from airflow.sdk import Variable
 
 from utils.slack_alerts import alert_slack
-from ml_code.data_pipeline import (
+from ml_code.data_pipeline_v2 import (
     extract_raw_data,
     validate_data,
     build_features,
@@ -38,7 +38,7 @@ def _get_pipeline_config():
 
         feature_path = Variable.get(
             "dp_feature_path",
-            default_var="s3://datapipeline-raw-data-keonho/features/user_events_feat_20251119.csv"
+            default_var="s3://datapipeline-raw-data-keonho/features/daily_user_events/"
         )
 
         pipeline_name = Variable.get(
@@ -47,7 +47,7 @@ def _get_pipeline_config():
         )
     except Exception:
         raw_path = "s3://datapipeline-raw-data-keonho/daily/user_events_20251119.csv"
-        feature_path = "s3://datapipeline-raw-data-keonho/features/user_events_feat_20251119.csv"
+        feature_path = "s3://datapipeline-raw-data-keonho/features/daily_user_events/"
         pipeline_name = "daily_user_events"
 
     return {
@@ -101,7 +101,7 @@ def task_summarize_run(**context):
     )
 
 with DAG(
-    dag_id="data_pipeline_daily_dev",
+    dag_id="data_pipeline_daily_dev_v2",
     default_args=default_args,
     schedule=None,  # ✔ 수동 실행
     catchup=False,
