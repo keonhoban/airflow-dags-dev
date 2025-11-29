@@ -6,9 +6,10 @@ from urllib.parse import urlparse
 
 import boto3
 from airflow.utils.log.logging_mixin import LoggingMixin
-from datetime import datetime
+from pendulum import timezone
 import json
 
+kst = timezone("Asia/Seoul")
 logger = LoggingMixin().log
 
 
@@ -221,7 +222,7 @@ def build_features(raw_path: str, feature_path: str, pipeline_name: str, ti):
         "columns": {
             "row_sum": "float"
         },
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": kst.now().to_iso8601_string(),
         "pipeline_name": pipeline_name,
     }
 
@@ -237,7 +238,7 @@ def build_features(raw_path: str, feature_path: str, pipeline_name: str, ti):
         "rows_feature": len(feature_rows),
         "raw_null_rate": raw_null_rate,
         "raw_valid": raw_valid,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": kst.now().to_iso8601_string(),
         "pipeline_name": pipeline_name,
     }
 
@@ -273,7 +274,10 @@ def store_features(feature_path: str, pipeline_name: str, ti):
     # 🔹 실행 기준 버전 아이디 (execution_date 없으면 UTC now fallback)
     exec_date = getattr(ti, "execution_date", None)
     if exec_date is None:
-        exec_date = datetime.utcnow()
+        exec_date = kst.now()
+    else:
+        exec_date = exec_date.in_timezone("Asia/Seoul")
+
     run_ts = exec_date.strftime("%Y%m%dT%H%M%S")
     version_id = f"v_{run_ts}"
 
