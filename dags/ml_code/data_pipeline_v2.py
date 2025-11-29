@@ -6,10 +6,12 @@ from urllib.parse import urlparse
 
 import boto3
 from airflow.utils.log.logging_mixin import LoggingMixin
-from pendulum import timezone
+from datetime import datetime, timezone, timedelta
 import json
 
-kst = timezone("Asia/Seoul")
+# 한국 시간 정의 (UTC+9)
+KST = timezone(timedelta(hours=9))
+
 logger = LoggingMixin().log
 
 
@@ -32,8 +34,6 @@ def _parse_s3_uri(uri: str):
 def _get_s3_client():
     """
     boto3 S3 client 생성.
-    - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION
-      또는 IAM Role(예: IRSA)로 자격 증명이 잡혀 있어야 합니다.
     """
     return boto3.client("s3")
 
@@ -43,27 +43,19 @@ def _get_s3_client():
 # -----------------------
 
 def extract_raw_data(raw_path: str, pipeline_name: str, ti):
-    """
-    ✅ Step 1: RAW 데이터 수집 (S3 기준)
-    - 이 단계에서는 'S3에 오늘자 RAW 파일이 존재하는지' 확인만 합니다.
-    """
     s3 = _get_s3_client()
     bucket, key = _parse_s3_uri(raw_path)
 
     logger.info(
         "[DP] pipeline=%s step=extract_raw_data action=head_object bucket=%s key=%s",
-        pipeline_name,
-        bucket,
-        key,
+        pipeline_name, bucket, key,
     )
 
-    # 파일 존재 여부 체크 (없으면 에러 발생)
     s3.head_object(Bucket=bucket, Key=key)
 
     logger.info(
         "[DP] pipeline=%s step=extract_raw_data status=success raw_path=%s",
-        pipeline_name,
-        raw_path,
+        pipeline_name, raw_path,
     )
 
     ti.xcom_push(key="dp_raw_path", value=raw_path)
@@ -74,59 +66,37 @@ def extract_raw_data(raw_path: str, pipeline_name: str, ti):
 # -----------------------
 
 def validate_data(raw_path: str, pipeline_name: str, ti):
-    """
-    ✅ Step 2: 데이터 검증
-    - S3에서 CSV를 읽어서 row 수, null 비율 등을 계산합니다.
-    - pandas 없이 csv 모듈로 처리해서 의존성을 줄였습니다.
-    """
     s3 = _get_s3_client()
     bucket, key = _parse_s3_uri(raw_path)
 
     logger.info(
         "[DP] pipeline=%s step=validate_data action=get_object bucket=%s key=%s",
-        pipeline_name,
-        bucket,
-        key,
+        pipeline_name, bucket, key,
     )
 
     obj = s3.get_object(Bucket=bucket, Key=key)
-    body = obj["Body"].read()
-    text = body.decode("utf-8")
+    text = obj["Body"].read().decode("utf-8")
 
     reader = csv.reader(io.StringIO(text))
     rows = 0
     null_count = 0
     total_cells = 0
-
     header = None
+
     for i, row in enumerate(reader):
         if i == 0:
             header = row
             continue
         rows += 1
         total_cells += len(row)
-        for cell in row:
-            # 빈 문자열을 null로 간주
-            if cell == "":
-                null_count += 1
+        null_count += sum(1 for cell in row if cell == "")
 
     null_rate = (null_count / total_cells) if total_cells > 0 else 0.0
-    valid = True
-    # 간단한 룰 예시: 전체 행이 1 이상이고, null_rate < 0.5
-    if rows == 0 or null_rate > 0.5:
-        valid = False
+    valid = not (rows == 0 or null_rate > 0.5)
 
     logger.info(
-        (
-            "[DP] pipeline=%s step=validate_data status=%s "
-            "rows=%d null_count=%d null_rate=%.4f raw_path=%s"
-        ),
-        pipeline_name,
-        "success" if valid else "failed",
-        rows,
-        null_count,
-        null_rate,
-        raw_path,
+        "[DP] pipeline=%s step=validate_data status=%s rows=%d null_count=%d null_rate=%.4f",
+        pipeline_name, "success" if valid else "failed", rows, null_count, null_rate,
     )
 
     ti.xcom_push(key="dp_rows", value=rows)
@@ -144,26 +114,16 @@ def validate_data(raw_path: str, pipeline_name: str, ti):
 # -----------------------
 
 def build_features(raw_path: str, feature_path: str, pipeline_name: str, ti):
-    """
-    ✅ Step 3: Feature 가공
-    - 예시로 event_value, amount, session_length_sec 같은 숫자형 컬럼만 뽑아서
-      합산 컬럼(row_sum)을 추가하는 구조를 가정합니다.
-    - 여기서는 단순화를 위해 CSV 파싱 후,
-      숫자 변환이 가능한 컬럼들만 사용합니다.
-    """
     s3 = _get_s3_client()
     bucket, key = _parse_s3_uri(raw_path)
 
     logger.info(
         "[DP] pipeline=%s step=build_features action=get_object bucket=%s key=%s",
-        pipeline_name,
-        bucket,
-        key,
+        pipeline_name, bucket, key,
     )
 
     obj = s3.get_object(Bucket=bucket, Key=key)
-    body = obj["Body"].read()
-    text = body.decode("utf-8")
+    text = obj["Body"].read().decode("utf-8")
 
     reader = csv.reader(io.StringIO(text))
     header = None
@@ -172,116 +132,96 @@ def build_features(raw_path: str, feature_path: str, pipeline_name: str, ti):
     for i, row in enumerate(reader):
         if i == 0:
             header = row
-            continue
-        rows.append(row)
+        else:
+            rows.append(row)
 
     if not header:
         raise ValueError("[DP] 헤더가 없는 CSV입니다.")
 
-    # 숫자형으로 쓸 후보 컬럼 이름들 (user_events 예시 기준)
-    numeric_candidates = {"user_id", "is_premium", "event_value", "amount", "session_length_sec"}
+    numeric_candidates = {
+        "user_id", "is_premium", "event_value", "amount", "session_length_sec"
+    }
 
-    # header 기준으로 어떤 인덱스가 numeric 후보인지 결정
     numeric_indices = [
         idx for idx, col in enumerate(header) if col in numeric_candidates
     ]
 
     feature_rows = []
-
     for row in rows:
         numeric_values = []
         for idx in numeric_indices:
-            if idx >= len(row):
-                continue
-            cell = row[idx]
-            if cell == "":
-                # 빈 값은 0으로 처리
-                numeric_values.append(0.0)
-            else:
+            if idx < len(row):
                 try:
-                    numeric_values.append(float(cell))
+                    numeric_values.append(float(row[idx] or 0))
                 except ValueError:
                     numeric_values.append(0.0)
-
-        row_sum = sum(numeric_values)
-        # 간단히: row_sum 하나만 있는 Feature row로 구성 (필요하면 더 확장 가능)
-        feature_rows.append([row_sum])
+        feature_rows.append([sum(numeric_values)])
 
     logger.info(
-        "[DP] pipeline=%s step=build_features status=success rows_in=%d rows_out=%d feature_path=%s",
-        pipeline_name,
-        len(rows),
-        len(feature_rows),
-        feature_path,
+        "[DP] pipeline=%s step=build_features status=success rows_in=%d rows_out=%d",
+        pipeline_name, len(rows), len(feature_rows),
     )
 
-    # 1) schema.json용 정보 만들기
-    feature_header = ["row_sum"]
+    # --- schema.json ---
     schema = {
-        "feature_version": None,  # 나중에 store_features에서 채움
-        "columns": {
-            "row_sum": "float"
-        },
-        "created_at": kst.now().to_iso8601_string(),
+        "feature_version": None,
+        "columns": {"row_sum": "float"},
+        "created_at": datetime.now(KST).isoformat(),
         "pipeline_name": pipeline_name,
     }
 
-    # 2) metadata.json용 정보 만들기
-    raw_rows = ti.xcom_pull(key="dp_rows", task_ids="validate_data")
-    raw_null_rate = ti.xcom_pull(key="dp_null_rate", task_ids="validate_data")
-    raw_valid = ti.xcom_pull(key="dp_valid", task_ids="validate_data")
-
-
+    # --- metadata.json ---
     metadata = {
         "source_raw_path": raw_path,
-        "rows_raw": raw_rows,
+        "rows_raw": ti.xcom_pull(key="dp_rows", task_ids="validate_data"),
         "rows_feature": len(feature_rows),
-        "raw_null_rate": raw_null_rate,
-        "raw_valid": raw_valid,
-        "created_at": kst.now().to_iso8601_string(),
+        "raw_null_rate": ti.xcom_pull(key="dp_null_rate", task_ids="validate_data"),
+        "raw_valid": ti.xcom_pull(key="dp_valid", task_ids="validate_data"),
+        "created_at": datetime.now(KST).isoformat(),
         "pipeline_name": pipeline_name,
     }
 
-
-    # 3) XCom에 같이 넘기기
+    # CSV 문자열로 직렬화
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(feature_header)
+    writer.writerow(["row_sum"])
     writer.writerows(feature_rows)
     feature_csv = buf.getvalue()
 
     ti.xcom_push(key="dp_feature_csv", value=feature_csv)
     ti.xcom_push(key="dp_feature_rows", value=len(feature_rows))
     ti.xcom_push(key="dp_feature_path", value=feature_path)
-
     ti.xcom_push(key="dp_schema_dict", value=schema)
     ti.xcom_push(key="dp_metadata_dict", value=metadata)
 
 
 # -----------------------
-# Step 4: Feature 저장 (S3)
+# Step 4: Feature 저장
 # -----------------------
 
 def store_features(feature_path: str, pipeline_name: str, ti):
     feature_csv = ti.xcom_pull(key="dp_feature_csv", task_ids="build_features")
-    feature_rows = ti.xcom_pull(key="dp_feature_rows", task_ids="build_features") or 0
+    feature_rows = ti.xcom_pull(key="dp_feature_rows", task_ids="build_features")
     schema = ti.xcom_pull(key="dp_schema_dict", task_ids="build_features")
     metadata = ti.xcom_pull(key="dp_metadata_dict", task_ids="build_features")
 
-    if feature_csv is None or schema is None or metadata is None:
-        raise ValueError("[DP] 필요한 XCom 정보(dp_feature_csv/schema/metadata) 누락")
+    if feature_csv is None:
+        raise ValueError("[DP] feature_csv 누락")
 
-    # 🔹 실행 기준 버전 아이디 (execution_date 없으면 UTC now fallback)
     exec_date = getattr(ti, "execution_date", None)
+
     if exec_date is None:
-        exec_date = kst.now()
+        exec_date = datetime.now(KST)
     else:
-        exec_date = exec_date.in_timezone("Asia/Seoul")
+        if exec_date.tzinfo is None:
+            exec_date = exec_date.replace(tzinfo=timezone.utc).astimezone(KST)
+        else:
+            exec_date = exec_date.astimezone(KST)
 
     run_ts = exec_date.strftime("%Y%m%dT%H%M%S")
     version_id = f"v_{run_ts}"
 
-    bucket, prefix = _parse_s3_uri(feature_path)  # feature_path를 prefix로 사용
+    bucket, prefix = _parse_s3_uri(feature_path)
     if not prefix.endswith("/"):
         prefix += "/"
 
@@ -289,47 +229,34 @@ def store_features(feature_path: str, pipeline_name: str, ti):
 
     s3 = _get_s3_client()
 
-    # 1) feature.csv
-    feature_key = f"{base_prefix}feature.csv"
-    logger.info(
-        "[DP] pipeline=%s step=store_features action=put_object bucket=%s key=%s rows=%d",
-        pipeline_name,
-        bucket,
-        feature_key,
-        feature_rows,
-    )
+    # feature.csv
     s3.put_object(
         Bucket=bucket,
-        Key=feature_key,
+        Key=f"{base_prefix}feature.csv",
         Body=feature_csv.encode("utf-8"),
         ContentType="text/csv",
     )
 
-    # 2) schema.json
+    # schema.json
     schema["feature_version"] = version_id
-    schema_key = f"{base_prefix}schema.json"
     s3.put_object(
         Bucket=bucket,
-        Key=schema_key,
+        Key=f"{base_prefix}schema.json",
         Body=json.dumps(schema, ensure_ascii=False, indent=2).encode("utf-8"),
         ContentType="application/json",
     )
 
-    # 3) metadata.json
-    metadata_key = f"{base_prefix}metadata.json"
+    # metadata.json
     s3.put_object(
         Bucket=bucket,
-        Key=metadata_key,
+        Key=f"{base_prefix}metadata.json",
         Body=json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
         ContentType="application/json",
     )
 
     logger.info(
-        "[DP] pipeline=%s step=store_features status=success prefix=%s version_id=%s rows=%d",
-        pipeline_name,
-        base_prefix,
-        version_id,
-        feature_rows,
+        "[DP] pipeline=%s step=store_features status=success prefix=%s version=%s",
+        pipeline_name, base_prefix, version_id,
     )
 
     ti.xcom_push(key="dp_stored_rows", value=feature_rows)
@@ -342,10 +269,6 @@ def store_features(feature_path: str, pipeline_name: str, ti):
 # -----------------------
 
 def summarize_run(pipeline_name: str, ti):
-    """
-    ✅ 마지막 Step: 실행 요약 로그
-    - Loki / Grafana에서 전체 파이프라인 상태를 한눈에 보기 위한 정보.
-    """
     raw_path = ti.xcom_pull(key="dp_raw_path", task_ids="extract_raw_data")
     rows = ti.xcom_pull(key="dp_rows", task_ids="validate_data")
     null_rate = ti.xcom_pull(key="dp_null_rate", task_ids="validate_data")
@@ -355,22 +278,13 @@ def summarize_run(pipeline_name: str, ti):
     feature_version = ti.xcom_pull(key="dp_feature_version", task_ids="store_features")
     stored_rows = ti.xcom_pull(key="dp_stored_rows", task_ids="store_features")
 
-    if feature_prefix and feature_version:
-        full_feature_path = f"{feature_prefix}feature.csv"
-    else:
-        full_feature_path = None
-
     logger.info(
-        (
-            "[DP] pipeline=%s step=summarize_run "
-            "raw_path=%s feature_prefix=%s feature_version=%s feature_path=%s "
-            "rows=%s null_rate=%s valid=%s stored_rows=%s"
-        ),
+        "[DP] pipeline=%s step=summarize_run raw_path=%s feature_prefix=%s "
+        "feature_version=%s rows=%s null_rate=%.4f valid=%s stored_rows=%s",
         pipeline_name,
         raw_path,
         feature_prefix,
         feature_version,
-        full_feature_path,
         rows,
         null_rate,
         valid,
