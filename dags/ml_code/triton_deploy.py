@@ -1,5 +1,6 @@
 import os, json, shutil
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import requests
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -8,11 +9,33 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 
 log = LoggingMixin().log
 
+def cfg(key: str, default=None, *, required: bool = False):
+    v = os.getenv(key)
+    if v is not None and str(v).strip() != "":
+        return v
+
+    try:
+        if default is None:
+            v = Variable.get(key)
+        else:
+            v = Variable.get(key, default_var=str(default))
+        if v is not None and str(v).strip() != "":
+            return v
+    except Exception:
+        pass
+
+    if required:
+        raise RuntimeError(f"[Config] missing required key: {key} (ENV or Airflow Variable)")
+    return default
+
+def utc_ts():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
 def kst_ts():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%dT%H%M%S")
 
 def select_prod(model_name: str, tag_key="stage", tag_value="Production"):
-    uri = Variable.get("MLFLOW_TRACKING_URI")
+    uri = cfg("MLFLOW_TRACKING_URI", required=True)
     mlflow.set_tracking_uri(uri)
     c = MlflowClient(tracking_uri=uri)
 
@@ -29,9 +52,9 @@ def select_prod(model_name: str, tag_key="stage", tag_value="Production"):
     return mv.version, mv.run_id
 
 def materialize(ti, **_):
-    model = Variable.get("triton_model_name")              # ex) simple_model
-    repo  = Variable.get("triton_repo_base", "/models")    # /models
-    onnx_rel = Variable.get("triton_onnx_artifact_path", "onnx/model.onnx")  # 고정
+    model = cfg("triton_model_name", required=True)
+    repo  = cfg("triton_repo_base", "/models")
+    onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
 
     v, run_id = select_prod(model)
 
@@ -40,7 +63,6 @@ def materialize(ti, **_):
     ver_dir = os.path.join(model_dir, deploy)
     os.makedirs(ver_dir, exist_ok=True)
 
-    # MLflow artifact -> 로컬 다운로드 -> NFS로 복사 (최종 파일명 model.onnx로 표준화)
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
     dst = os.path.join(ver_dir, "model.onnx")
     shutil.copyfile(local, dst)
@@ -55,7 +77,7 @@ def materialize(ti, **_):
 
 def triton_load(ti, **_):
     model = ti.xcom_pull(task_ids="materialize_repo", key="model")
-    triton = Variable.get("triton_http_url")  # ex) http://triton.triton-dev...:8000
+    triton = cfg("triton_http_url", required=True)
 
     r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=5)
     if r.status_code != 200:
@@ -73,4 +95,3 @@ def commit_current(ti, **_):
     with open(path + ".tmp", "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(path + ".tmp", path)
-
