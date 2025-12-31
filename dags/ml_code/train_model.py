@@ -1,5 +1,5 @@
-# ml_code/train_model.py
-
+# ml_code/train_model.py 
+import os
 import mlflow
 import mlflow.sklearn
 from sklearn.datasets import load_iris
@@ -7,11 +7,29 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from mlflow.tracking import MlflowClient
-from ml_code.config import get_tracking_uri
-from ml_code.config import get_experiment_name
+from ml_code.config import get_tracking_uri, get_experiment_name
 from airflow.utils.log.logging_mixin import LoggingMixin
 
+# ONNX 추가
+import numpy as np
+from skl2onnx import convert_sklearn
+from skl2onnx.common.data_types import FloatTensorType
+
 logger = LoggingMixin().log
+
+def export_onnx_and_log_artifact(clf, X_train):
+    """
+    runs:/<run_id>/onnx/model.onnx 로 항상 저장되도록 보장
+    """
+    initial_type = [("input", FloatTensorType([None, X_train.shape[1]]))]
+    onnx_model = convert_sklearn(clf, initial_types=initial_type)
+
+    onnx_path = "/tmp/model.onnx"
+    with open(onnx_path, "wb") as f:
+        f.write(onnx_model.SerializeToString())
+
+    mlflow.log_artifact(onnx_path, artifact_path="onnx")
+    logger.info("[ONNX] logged: onnx/model.onnx")
 
 def train_model(C, max_iter):
     tracking_uri = get_tracking_uri()
@@ -46,9 +64,15 @@ def train_model(C, max_iter):
             mlflow.log_param("C", C)
             mlflow.log_param("max_iter", max_iter)
             mlflow.log_metric("accuracy", acc)
+
+            # 기존 MLflow Model 패키지
             mlflow.sklearn.log_model(clf, "model")
 
+            # ONNX도 같이 저장
+            export_onnx_and_log_artifact(clf, X_train)
+
             return acc, run_id
+
     except Exception as e:
         logger.error(f"[ERROR] ❌ 학습 또는 로깅 중 오류: {e}")
         raise
