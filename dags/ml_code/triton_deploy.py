@@ -15,6 +15,42 @@ log = LoggingMixin().log
 
 
 # -----------------------
+# Triton config template
+# -----------------------
+# NOTE:
+# - 현재 best_model ONNX의 입출력을 /v2/models/best_model 결과에 맞춰 고정
+# - 운영에서는 이 템플릿을 "모델별/버전별"로 분리하거나, ONNX에서 shape/name을 파싱해 생성하는 방식으로 확장 가능
+CONFIG_TEMPLATE = """\
+name: "{model}"
+platform: "onnxruntime_onnx"
+
+# iris logistic regression은 실시간 단건 추론이 목적이므로 batch 비활성(0)
+max_batch_size: 0
+
+input [
+  {{
+    name: "input"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  }}
+]
+
+output [
+  {{
+    name: "probabilities"
+    data_type: TYPE_FP32
+    dims: [ 3 ]
+  }},
+  {{
+    name: "label"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  }}
+]
+"""
+
+
+# -----------------------
 # Config helpers
 # -----------------------
 def cfg(key: str, default=None, *, required: bool = False):
@@ -85,6 +121,7 @@ def materialize(ti, alias: str = "A", **_):
     """
     - UI params.alias 로 alias 주입 받음
     - Triton repository 규칙: {repo}/{model}/{version}/model.onnx
+    - 실무형: 같은 폴더에 config.pbtxt도 생성(명시적 구성)
     """
     model = cfg("triton_model_name", required=True)  # 예: best_model
     repo = cfg("triton_repo_base", "/models")        # Triton이 마운트한 model repo
@@ -99,11 +136,17 @@ def materialize(ti, alias: str = "A", **_):
     ver_dir = os.path.join(model_dir, str(v))  # ✅ Triton은 정수 버전 폴더 권장
     os.makedirs(ver_dir, exist_ok=True)
 
-    # MLflow artifact -> 로컬 다운로드 -> NFS 복사
+    # 1) MLflow artifact -> 로컬 다운로드 -> NFS 복사
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
     dst = os.path.join(ver_dir, "model.onnx")
     shutil.copyfile(local, dst)
 
+    # 2) config.pbtxt 생성 (명시적 운영)
+    config_path = os.path.join(ver_dir, "config.pbtxt")
+    with open(config_path, "w") as f:
+        f.write(CONFIG_TEMPLATE.format(model=model))
+
+    # XCom
     ti.xcom_push(key="model", value=model)
     ti.xcom_push(key="model_dir", value=model_dir)
     ti.xcom_push(key="deploy_version", value=v)
@@ -111,6 +154,7 @@ def materialize(ti, alias: str = "A", **_):
     ti.xcom_push(key="alias", value=alias)
 
     log.info("[W6] materialize OK model=%s alias=@%s version=%s dst=%s", model, alias, v, dst)
+    log.info("[W6] config.pbtxt created path=%s", config_path)
 
 
 def triton_load(ti, **_):
