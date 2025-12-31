@@ -44,7 +44,7 @@ output [
   {{
     name: "label"
     data_type: TYPE_INT64
-    dims: [ -1, 1 ]
+    dims: [ -1 ]
   }}
 ]
 """
