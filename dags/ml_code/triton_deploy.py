@@ -31,7 +31,7 @@ input [
   {{
     name: "input"
     data_type: TYPE_FP32
-    dims: [ 4 ]
+    dims: [ -1, 4 ]
   }}
 ]
 
@@ -39,12 +39,12 @@ output [
   {{
     name: "probabilities"
     data_type: TYPE_FP32
-    dims: [ 3 ]
+    dims: [ -1, 3 ]
   }},
   {{
     name: "label"
     data_type: TYPE_INT64
-    dims: [ 1 ]
+    dims: [ -1, 1 ]
   }}
 ]
 """
