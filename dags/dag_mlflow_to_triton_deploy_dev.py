@@ -1,3 +1,4 @@
+# dags/dag_mlflow_to_triton_deploy_dev.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
@@ -8,12 +9,12 @@ kst = timezone("Asia/Seoul")
 
 with DAG(
     dag_id="mlflow_to_triton_min_dev",
-    start_date=datetime(2025,1,1,tzinfo=kst),
+    start_date=datetime(2025, 1, 1, tzinfo=kst),
     schedule=None,
     catchup=False,
-    tags=["w6","triton","dev"],
+    tags=["w6", "triton", "dev"],
     params={
-        "alias": "A",   # UI에서 Trigger 할 때 바꿀 수 있음
+        "alias": "A",  # UI에서 Trigger 시 변경 가능
     },
 ) as dag:
 

@@ -1,3 +1,5 @@
+# dags/ml_code/triton_deploy.py
+
 import os, json, shutil
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -12,10 +14,13 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 log = LoggingMixin().log
 
 
-# -----------------------------------------------------------------------------
-# Config helper: ENV -> Airflow Variable -> default
-# -----------------------------------------------------------------------------
+# -----------------------
+# Config helpers
+# -----------------------
 def cfg(key: str, default=None, *, required: bool = False):
+    """
+    우선순위: ENV > Airflow Variable > default
+    """
     v = os.getenv(key)
     if v is not None and str(v).strip() != "":
         return v
@@ -35,9 +40,6 @@ def cfg(key: str, default=None, *, required: bool = False):
     return default
 
 
-# -----------------------------------------------------------------------------
-# Time helpers
-# -----------------------------------------------------------------------------
 def utc_ts():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
@@ -46,93 +48,94 @@ def kst_ts():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%dT%H%M%S")
 
 
-# -----------------------------------------------------------------------------
-# MLflow: select model version by alias (ex: @A / @B)
-# -----------------------------------------------------------------------------
+def build_triton_http_url() -> str:
+    """
+    클러스터 내부 통신용 Triton URL 생성
+    - 기본: http://triton.triton-dev.svc.cluster.local:8000
+    - 필요한 경우 ENV/Variable로 override 가능
+    """
+    svc = cfg("TRITON_SERVICE", "triton")
+    ns = cfg("TRITON_NAMESPACE", "triton-dev")
+    port = cfg("TRITON_HTTP_PORT", "8000")
+
+    # 명시적으로 전체 URL을 주고 싶으면 이것만 세팅해도 됨(선택)
+    full = cfg("TRITON_HTTP_URL", None)
+    if full:
+        return full
+
+    return f"http://{svc}.{ns}.svc.cluster.local:{port}"
+
+
+# -----------------------
+# MLflow selection
+# -----------------------
 def select_by_alias(model_name: str, alias: str):
     uri = cfg("MLFLOW_TRACKING_URI", required=True)
     mlflow.set_tracking_uri(uri)
     c = MlflowClient(tracking_uri=uri)
 
-    try:
-        mv = c.get_model_version_by_alias(model_name, alias)
-    except Exception as e:
-        raise RuntimeError(f"no alias version: {model_name} alias=@{alias} ({e})")
-
+    mv = c.get_model_version_by_alias(model_name, alias)
     return int(mv.version), mv.run_id
 
 
-# -----------------------------------------------------------------------------
-# Task 1) materialize_repo
-# - Select prod target by alias
-# - Download ONNX from MLflow run artifacts
-# - Copy to NFS-backed Triton model repo (/models)
-# -----------------------------------------------------------------------------
-def materialize(ti, alias=None, **_):
-    model = cfg("triton_model_name", required=True)               # ex) best_model
-    alias = (alias or cfg("triton_model_alias", "A")).strip()     # ex) A or B
-    repo  = cfg("triton_repo_base", "/models")                    # ex) /models
-    onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")# fixed rel path
+# -----------------------
+# Tasks
+# -----------------------
+def materialize(ti, alias: str = "A", **_):
+    """
+    - UI params.alias 로 alias 주입 받음
+    - Triton repository 규칙: {repo}/{model}/{version}/model.onnx
+    """
+    model = cfg("triton_model_name", required=True)  # 예: best_model
+    repo = cfg("triton_repo_base", "/models")        # Triton이 마운트한 model repo
+    onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")  # runs:/.../onnx/model.onnx
 
-    v, run_id = select_by_alias(model, alias=alias)
+    # alias는 DAG params가 1순위. (빈 문자열 방어)
+    alias = (alias or "").strip() or cfg("mlflow_alias", "A")
 
-    deploy = f"v{v}_{kst_ts()}"
+    v, run_id = select_by_alias(model, alias)
+
     model_dir = os.path.join(repo, model)
-    ver_dir = os.path.join(model_dir, deploy)
+    ver_dir = os.path.join(model_dir, str(v))  # ✅ Triton은 정수 버전 폴더 권장
     os.makedirs(ver_dir, exist_ok=True)
 
-    # MLflow artifact -> local -> NFS copy (standardize name to model.onnx)
+    # MLflow artifact -> 로컬 다운로드 -> NFS 복사
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
     dst = os.path.join(ver_dir, "model.onnx")
     shutil.copyfile(local, dst)
 
-    # XCom for downstream tasks
     ti.xcom_push(key="model", value=model)
-    ti.xcom_push(key="alias", value=alias)
     ti.xcom_push(key="model_dir", value=model_dir)
-    ti.xcom_push(key="deploy", value=deploy)
-    ti.xcom_push(key="mlflow_version", value=int(v))
+    ti.xcom_push(key="deploy_version", value=v)
     ti.xcom_push(key="run_id", value=run_id)
-    ti.xcom_push(key="onnx_dst", value=dst)
+    ti.xcom_push(key="alias", value=alias)
 
-    log.info(
-        "[W6] materialize OK model=%s alias=@%s deploy=%s mlflow_v=%s run_id=%s dst=%s",
-        model, alias, deploy, v, run_id, dst
-    )
+    log.info("[W6] materialize OK model=%s alias=@%s version=%s dst=%s", model, alias, v, dst)
 
 
-# -----------------------------------------------------------------------------
-# Task 2) triton_load
-# - Ask Triton to load model (repository API)
-# -----------------------------------------------------------------------------
 def triton_load(ti, **_):
     model = ti.xcom_pull(task_ids="materialize_repo", key="model")
-    triton = cfg("triton_http_url", required=True)  # ex) http://triton...:8000
+    alias = ti.xcom_pull(task_ids="materialize_repo", key="alias")
+    triton = build_triton_http_url()
 
-    r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=5)
+    log.info("[W6] triton_load model=%s alias=@%s triton=%s", model, alias, triton)
+
+    r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"load failed: {r.status_code} {r.text}")
 
-    log.info("[W6] triton_load OK model=%s status=%s", model, r.status_code)
 
-
-# -----------------------------------------------------------------------------
-# Task 3) commit_current
-# - Write current.json so "what is active" is traceable
-# -----------------------------------------------------------------------------
 def commit_current(ti, **_):
     model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir")
     payload = {
-        "active_version": ti.xcom_pull(task_ids="materialize_repo", key="deploy"),
-        "mlflow_version": ti.xcom_pull(task_ids="materialize_repo", key="mlflow_version"),
+        "active_version": ti.xcom_pull(task_ids="materialize_repo", key="deploy_version"),
         "run_id": ti.xcom_pull(task_ids="materialize_repo", key="run_id"),
         "alias": ti.xcom_pull(task_ids="materialize_repo", key="alias"),
         "updated_at_utc": utc_ts(),
     }
-
     path = os.path.join(model_dir, "current.json")
     with open(path + ".tmp", "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(path + ".tmp", path)
 
-    log.info("[W6] commit_current OK path=%s payload=%s", path, payload)
+    log.info("[W6] commit_current OK path=%s", path)
