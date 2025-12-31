@@ -12,9 +12,16 @@ with DAG(
     schedule=None,
     catchup=False,
     tags=["w6","triton","dev"],
+    params={
+        "alias": "A",   # UI에서 Trigger 할 때 바꿀 수 있음
+    },
 ) as dag:
 
-    t1 = PythonOperator(task_id="materialize_repo", python_callable=materialize)
+    t1 = PythonOperator(
+        task_id="materialize_repo",
+        python_callable=materialize,
+        op_kwargs={"alias": "{{ params.alias }}"},
+    )
     t2 = PythonOperator(task_id="triton_load", python_callable=triton_load)
     t3 = PythonOperator(task_id="commit_current", python_callable=commit_current)
 
