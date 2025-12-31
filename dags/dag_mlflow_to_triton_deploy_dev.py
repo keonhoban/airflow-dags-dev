@@ -22,7 +22,7 @@ with DAG(
     catchup=False,
     tags=["w6", "triton", "dev"],
     params={
-        "alias": "A",
+        "alias": "A",  # UI에서 Trigger 시 변경 가능
     },
 ) as dag:
 
@@ -37,19 +37,19 @@ with DAG(
         python_callable=triton_load,
     )
 
-    t3 = PythonOperator(
+    t_ready = PythonOperator(
         task_id="triton_ready",
         python_callable=triton_ready,
     )
 
-    t4 = PythonOperator(
+    t_smoke = PythonOperator(
         task_id="triton_infer_smoke",
         python_callable=triton_infer_smoke,
     )
 
-    t5 = PythonOperator(
+    t3 = PythonOperator(
         task_id="commit_current",
         python_callable=commit_current,
     )
 
-    t1 >> t2 >> t3 >> t4 >> t5
+    t1 >> t2 >> t_ready >> t_smoke >> t3
