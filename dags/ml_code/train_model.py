@@ -20,9 +20,15 @@ logger = LoggingMixin().log
 def export_onnx_and_log_artifact(clf, X_train):
     """
     runs:/<run_id>/onnx/model.onnx 로 항상 저장되도록 보장
+    Triton 호환을 위해 확률 출력이 SEQUENCE가 아니라 TENSOR가 되도록 zipmap 비활성화
     """
     initial_type = [("input", FloatTensorType([None, X_train.shape[1]]))]
-    onnx_model = convert_sklearn(clf, initial_types=initial_type)
+
+    onnx_model = convert_sklearn(
+        clf,
+        initial_types=initial_type,
+        options={id(clf): {"zipmap": False}}  # ⭐ 핵심
+    )
 
     onnx_path = "/tmp/model.onnx"
     with open(onnx_path, "wb") as f:
@@ -30,6 +36,7 @@ def export_onnx_and_log_artifact(clf, X_train):
 
     mlflow.log_artifact(onnx_path, artifact_path="onnx")
     logger.info("[ONNX] logged: onnx/model.onnx")
+
 
 def train_model(C, max_iter):
     tracking_uri = get_tracking_uri()
