@@ -2,15 +2,18 @@
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 from datetime import datetime
 from pendulum import timezone
 
 from ml_code.triton_deploy import (
+    snapshot_current,
     materialize,
     triton_load,
     triton_ready,
     triton_infer_smoke,
     commit_current,
+    rollback_minimal,
 )
 
 kst = timezone("Asia/Seoul")
@@ -21,10 +24,13 @@ with DAG(
     schedule=None,
     catchup=False,
     tags=["w6", "triton", "dev"],
-    params={
-        "alias": "A",  # UI에서 Trigger 시 변경 가능
-    },
+    params={"alias": "A"},
 ) as dag:
+
+    t0 = PythonOperator(
+        task_id="snapshot_current",
+        python_callable=snapshot_current,
+    )
 
     t1 = PythonOperator(
         task_id="materialize_repo",
@@ -50,6 +56,17 @@ with DAG(
     t3 = PythonOperator(
         task_id="commit_current",
         python_callable=commit_current,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
-    t1 >> t2 >> t_ready >> t_smoke >> t3
+    t_rb = PythonOperator(
+        task_id="rollback_minimal",
+        python_callable=rollback_minimal,
+        trigger_rule=TriggerRule.ONE_FAILED,
+    )
+
+    # success path
+    t0 >> t1 >> t2 >> t_ready >> t_smoke >> t3
+
+    # rollback path (snapshot도 upstream에 포함)
+    [t0, t1, t2, t_ready, t_smoke] >> t_rb

@@ -1,6 +1,6 @@
 # dags/ml_code/triton_deploy.py
 
-import os, json, shutil
+import os, json, shutil, time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,14 +17,10 @@ log = LoggingMixin().log
 # -----------------------
 # Triton config template
 # -----------------------
-# NOTE:
-# - 현재 best_model ONNX의 입출력을 /v2/models/best_model 결과에 맞춰 고정
-# - 운영에서는 이 템플릿을 "모델별/버전별"로 분리하거나, ONNX에서 shape/name을 파싱해 생성하는 방식으로 확장 가능
 CONFIG_TEMPLATE = """\
 name: "{model}"
 platform: "onnxruntime_onnx"
 
-# iris logistic regression은 실시간 단건 추론이 목적이므로 batch 비활성(0)
 max_batch_size: 0
 
 input [
@@ -85,16 +81,10 @@ def kst_ts():
 
 
 def build_triton_http_url() -> str:
-    """
-    클러스터 내부 통신용 Triton URL 생성
-    - 기본: http://triton.triton-dev.svc.cluster.local:8000
-    - 필요한 경우 ENV/Variable로 override 가능
-    """
     svc = cfg("TRITON_SERVICE", "triton")
     ns = cfg("TRITON_NAMESPACE", "triton-dev")
     port = cfg("TRITON_HTTP_PORT", "8000")
 
-    # 명시적으로 전체 URL을 주고 싶으면 이것만 세팅해도 됨(선택)
     full = cfg("TRITON_HTTP_URL", None)
     if full:
         return full
@@ -117,39 +107,45 @@ def select_by_alias(model_name: str, alias: str):
 # -----------------------
 # Tasks
 # -----------------------
+def snapshot_current(ti, **_):
+    model = cfg("triton_model_name", required=True)
+    repo = cfg("triton_repo_base", "/models")
+    model_dir = os.path.join(repo, model)
+    path = os.path.join(model_dir, "current.json")
+
+    prev = None
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                prev = json.load(f)
+        except Exception as e:
+            log.warning("[W6] snapshot_current: failed to read current.json (%s). treat as None", e)
+
+    ti.xcom_push(key="prev_current", value=prev)
+    log.info("[W6] snapshot_current OK model=%s path=%s prev=%s", model, path, prev)
+
+
 def materialize(ti, alias: str = "A", **_):
-    """
-    - UI params.alias 로 alias 주입 받음
-    - Triton repository 규칙: {repo}/{model}/{version}/model.onnx
-    - 실무형:
-      - model root에 config.pbtxt 생성 (표준 구조)
-      - version dir에 model.onnx 배치
-    """
-    model = cfg("triton_model_name", required=True)  # 예: best_model
-    repo = cfg("triton_repo_base", "/models")        # Triton이 마운트한 model repo
-    onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")  # runs:/.../onnx/model.onnx
+    model = cfg("triton_model_name", required=True)
+    repo = cfg("triton_repo_base", "/models")
+    onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
 
-    # alias는 DAG params가 1순위. (빈 문자열 방어)
     alias = (alias or "").strip() or cfg("mlflow_alias", "A")
-
     v, run_id = select_by_alias(model, alias)
 
     model_dir = os.path.join(repo, model)
-    ver_dir = os.path.join(model_dir, str(v))  # ✅ Triton은 정수 버전 폴더 권장
+    ver_dir = os.path.join(model_dir, str(v))
     os.makedirs(ver_dir, exist_ok=True)
 
-    # 1) MLflow artifact -> 로컬 다운로드 -> NFS 복사
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
     dst = os.path.join(ver_dir, "model.onnx")
     shutil.copyfile(local, dst)
 
-    # 2) config.pbtxt 생성 (✅ 표준: model root)
     os.makedirs(model_dir, exist_ok=True)
     config_path = os.path.join(model_dir, "config.pbtxt")
     with open(config_path, "w") as f:
         f.write(CONFIG_TEMPLATE.format(model=model))
 
-    # XCom
     ti.xcom_push(key="model", value=model)
     ti.xcom_push(key="model_dir", value=model_dir)
     ti.xcom_push(key="deploy_version", value=v)
@@ -157,7 +153,7 @@ def materialize(ti, alias: str = "A", **_):
     ti.xcom_push(key="alias", value=alias)
 
     log.info("[W6] materialize OK model=%s alias=@%s version=%s dst=%s", model, alias, v, dst)
-    log.info("[W6] config.pbtxt created path=%s", config_path)
+    log.info("[W6] config.pbtxt created/updated path=%s", config_path)
 
 
 def triton_load(ti, **_):
@@ -189,7 +185,6 @@ def triton_infer_smoke(ti, **_):
     model = ti.xcom_pull(task_ids="materialize_repo", key="model")
     triton = build_triton_http_url()
 
-    # iris 샘플 1건 (input dims=4)
     payload = {
         "inputs": [
             {
@@ -210,8 +205,7 @@ def triton_infer_smoke(ti, **_):
     if r.status_code != 200:
         raise RuntimeError(f"[W6] infer failed: {r.status_code} {r.text}")
 
-    resp = r.json()
-    log.info("[W6] infer smoke OK model=%s resp=%s", model, resp)
+    log.info("[W6] infer smoke OK model=%s resp=%s", model, r.json())
 
 
 def commit_current(ti, **_):
@@ -222,9 +216,67 @@ def commit_current(ti, **_):
         "alias": ti.xcom_pull(task_ids="materialize_repo", key="alias"),
         "updated_at_utc": utc_ts(),
     }
+
     path = os.path.join(model_dir, "current.json")
     with open(path + ".tmp", "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(path + ".tmp", path)
 
-    log.info("[W6] commit_current OK path=%s", path)
+    log.info("[W6] commit_current OK path=%s payload=%s", path, payload)
+
+
+def rollback_minimal(ti, **_):
+    model = ti.xcom_pull(task_ids="materialize_repo", key="model") or cfg("triton_model_name", required=True)
+    model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir") or os.path.join(cfg("triton_repo_base", "/models"), model)
+    deploy_v = ti.xcom_pull(task_ids="materialize_repo", key="deploy_version")
+
+    # ✅ 방어: snapshot task가 실패/스킵이면 prev가 None일 수 있음
+    prev = ti.xcom_pull(task_ids="snapshot_current", key="prev_current")  # may be None
+
+    triton = build_triton_http_url()
+    log.warning("[W6][ROLLBACK] start model=%s deploy_version=%s prev_current=%s", model, deploy_v, prev)
+
+    # (1) current.json 복구 (가능한 경우만)
+    if prev is not None:
+        path = os.path.join(model_dir, "current.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(prev, f, indent=2)
+        os.replace(path + ".tmp", path)
+        log.warning("[W6][ROLLBACK] restored current.json path=%s", path)
+    else:
+        log.warning("[W6][ROLLBACK] prev_current is None (no previous). skip current.json restore.")
+
+    # (2) 실패한 새 버전 폴더 격리
+    if deploy_v is not None:
+        ver_dir = os.path.join(model_dir, str(deploy_v))
+        if os.path.isdir(ver_dir):
+            failed_dir = ver_dir + f".failed_{utc_ts()}"
+            try:
+                os.replace(ver_dir, failed_dir)
+                log.warning("[W6][ROLLBACK] moved failed version dir %s -> %s", ver_dir, failed_dir)
+            except Exception as e:
+                log.warning("[W6][ROLLBACK] failed to move version dir (%s). keep as-is. err=%s", ver_dir, e)
+
+    # (3) Triton unload -> load (best-effort)
+    try:
+        r1 = requests.post(f"{triton}/v2/repository/models/{model}/unload", timeout=10)
+        log.warning("[W6][ROLLBACK] unload status=%s body=%s", r1.status_code, (r1.text or "")[:200])
+    except Exception as e:
+        log.warning("[W6][ROLLBACK] unload request failed: %s", e)
+
+    time.sleep(1)
+
+    try:
+        r2 = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
+        log.warning("[W6][ROLLBACK] load status=%s body=%s", r2.status_code, (r2.text or "")[:200])
+    except Exception as e:
+        log.warning("[W6][ROLLBACK] load request failed: %s", e)
+
+    # (4) ready best-effort
+    try:
+        r3 = requests.get(f"{triton}/v2/models/{model}/ready", timeout=5)
+        log.warning("[W6][ROLLBACK] ready status=%s", r3.status_code)
+    except Exception as e:
+        log.warning("[W6][ROLLBACK] ready check failed: %s", e)
+
+    log.warning("[W6][ROLLBACK] done model=%s", model)
