@@ -78,5 +78,5 @@ with DAG(
     # success path
     t0 >> t1 >> t2 >> t_ready >> t_smoke >> t3
 
-    # rollback path (snapshot도 upstream에 포함)
-    [t0, t1, t2, t_ready, t_smoke] >> t_rb
+    # rollback path (snapshot 제외)
+    [t1, t2, t_ready, t_smoke] >> t_rb

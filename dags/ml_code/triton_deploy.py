@@ -124,7 +124,6 @@ def snapshot_current(ti, **_):
     ti.xcom_push(key="prev_current", value=prev)
     log.info("[W6] snapshot_current OK model=%s path=%s prev=%s", model, path, prev)
 
-
 def materialize(ti, alias: str = "A", **_):
     model = cfg("triton_model_name", required=True)
     repo = cfg("triton_repo_base", "/models")
@@ -137,22 +136,24 @@ def materialize(ti, alias: str = "A", **_):
     ver_dir = os.path.join(model_dir, str(v))
     os.makedirs(ver_dir, exist_ok=True)
 
+    # 1) ONNX 다운로드
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
+
+    # 2) model.onnx 원자적 교체 (tmp -> replace)
     dst = os.path.join(ver_dir, "model.onnx")
     tmp = dst + ".tmp"
-
-    shutil.copyfile(local, dst)
+    shutil.copyfile(local, tmp)
     os.replace(tmp, dst)
 
+    # 3) config.pbtxt 원자적 교체 (tmp -> replace)  ✅ 표준: model root
     os.makedirs(model_dir, exist_ok=True)
     config_path = os.path.join(model_dir, "config.pbtxt")
-    os.replace(tmp, dst)
-
-    with open(config_path, "w") as f:
+    tmp_cfg = config_path + ".tmp"
+    with open(tmp_cfg, "w") as f:
         f.write(CONFIG_TEMPLATE.format(model=model))
-
     os.replace(tmp_cfg, config_path)
 
+    # XCom
     ti.xcom_push(key="model", value=model)
     ti.xcom_push(key="model_dir", value=model_dir)
     ti.xcom_push(key="deploy_version", value=v)
@@ -161,7 +162,6 @@ def materialize(ti, alias: str = "A", **_):
 
     log.info("[W6] materialize OK model=%s alias=@%s version=%s dst=%s", model, alias, v, dst)
     log.info("[W6] config.pbtxt created/updated path=%s", config_path)
-
 
 def triton_load(ti, **_):
     model = ti.xcom_pull(task_ids="materialize_repo", key="model")
