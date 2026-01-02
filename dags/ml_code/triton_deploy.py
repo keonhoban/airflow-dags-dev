@@ -139,12 +139,19 @@ def materialize(ti, alias: str = "A", **_):
 
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/{onnx_rel}")
     dst = os.path.join(ver_dir, "model.onnx")
+    tmp = dst + ".tmp"
+
     shutil.copyfile(local, dst)
+    os.replace(tmp, dst)
 
     os.makedirs(model_dir, exist_ok=True)
     config_path = os.path.join(model_dir, "config.pbtxt")
+    os.replace(tmp, dst)
+
     with open(config_path, "w") as f:
         f.write(CONFIG_TEMPLATE.format(model=model))
+
+    os.replace(tmp_cfg, config_path)
 
     ti.xcom_push(key="model", value=model)
     ti.xcom_push(key="model_dir", value=model_dir)
