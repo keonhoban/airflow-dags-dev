@@ -27,7 +27,7 @@ input [
   {{
     name: "input"
     data_type: TYPE_FP32
-    dims: [ -1, 4 ]
+    dims: [ 4 ]
   }}
 ]
 
