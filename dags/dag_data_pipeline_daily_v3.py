@@ -113,7 +113,7 @@ def task_summarize_run(**context):
 
 
 with DAG(
-    dag_id="data_pipeline_daily_dev_v2",
+    dag_id="data_pipeline_daily_dev_v3",
     default_args=default_args,
     schedule=None,  # 수동 실행 (원하면 cron으로 변경)
     catchup=False,
