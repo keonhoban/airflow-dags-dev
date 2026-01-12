@@ -11,7 +11,7 @@ from airflow.utils.trigger_rule import TriggerRule
 from airflow.sdk import Variable
 
 from utils.slack_alerts import alert_slack
-from ml_code.data_pipeline_v2 import (
+from ml_code.data_pipeline_v3 import (
     extract_raw_data,
     validate_data,
     build_features,
