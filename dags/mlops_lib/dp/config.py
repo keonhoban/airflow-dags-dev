@@ -34,7 +34,7 @@ def load_pipeline_config() -> PipelineConfig:
     )
     feature_base = _get_var(
         "dp_feature_base",
-        "s3://datapipeline-raw-data-keonho/features/feature-store",
+        "s3://datapipeline-raw-data-keonho/feature-store",
     )
     pipeline_name = _get_var(
         "dp_pipeline_name",
