@@ -1,4 +1,4 @@
-# dags/dag_data_pipeline_daily_v2.py
+# dags/dag_data_pipeline_daily_v3.py
 
 from __future__ import annotations
 
@@ -30,12 +30,13 @@ default_args = {
 
 def _get_pipeline_config() -> dict:
     """
-    Airflow Variable 기반으로 파이프라인 설정을 가져옵니다.
-    Variable이 없거나 읽기 실패 시에는 default를 사용합니다.
+    Airflow Variable 기반 파이프라인 설정.
 
     Variables:
       - dp_raw_path: s3://<bucket>/<key>.csv
-      - dp_feature_path: s3://<bucket>/<prefix>/
+      - dp_feature_base: s3://<bucket>/<prefix>/feature-store
+          (v3는 feature_set/version을 내부에서 붙여서 저장)
+      - dp_feature_set: e.g., user_features
       - dp_pipeline_name: e.g., daily_user_events
     """
     try:
@@ -43,23 +44,34 @@ def _get_pipeline_config() -> dict:
             "dp_raw_path",
             default_var="s3://datapipeline-raw-data-keonho/daily/user_events_20251119.csv",
         )
-        feature_path = Variable.get(
-            "dp_feature_path",
-            default_var="s3://datapipeline-raw-data-keonho/features/daily_user_events/",
+
+        # ✅ v3의 핵심: "base" 경로 (여기에 feature_set/version을 붙여 저장)
+        feature_base = Variable.get(
+            "dp_feature_base",
+            default_var="s3://datapipeline-raw-data-keonho/feature-store",
         )
+
+        # ✅ schema의 feature_set과 반드시 일치해야 함
+        feature_set = Variable.get(
+            "dp_feature_set",
+            default_var="user_features",
+        )
+
         pipeline_name = Variable.get(
             "dp_pipeline_name",
             default_var="daily_user_events",
         )
+
     except Exception:
-        # 방어적 fallback
         raw_path = "s3://datapipeline-raw-data-keonho/daily/user_events_20251119.csv"
-        feature_path = "s3://datapipeline-raw-data-keonho/features/daily_user_events/"
+        feature_base = "s3://datapipeline-raw-data-keonho/feature-store"
+        feature_set = "user_features"
         pipeline_name = "daily_user_events"
 
     return {
         "raw_path": raw_path,
-        "feature_path": feature_path,
+        "feature_base": feature_base,
+        "feature_set": feature_set,
         "pipeline_name": pipeline_name,
     }
 
@@ -89,8 +101,9 @@ def task_build_features(**context):
     cfg = _get_pipeline_config()
     build_features(
         raw_path=cfg["raw_path"],
-        feature_path=cfg["feature_path"],
+        feature_base=cfg["feature_base"],
         pipeline_name=cfg["pipeline_name"],
+        feature_set=cfg["feature_set"],
         ti=context["ti"],
     )
 
@@ -98,8 +111,9 @@ def task_build_features(**context):
 def task_store_features(**context):
     cfg = _get_pipeline_config()
     store_features(
-        feature_path=cfg["feature_path"],
+        feature_base=cfg["feature_base"],
         pipeline_name=cfg["pipeline_name"],
+        feature_set=cfg["feature_set"],
         ti=context["ti"],
     )
 
@@ -108,6 +122,7 @@ def task_summarize_run(**context):
     cfg = _get_pipeline_config()
     summarize_run(
         pipeline_name=cfg["pipeline_name"],
+        feature_set=cfg["feature_set"],
         ti=context["ti"],
     )
 
@@ -115,7 +130,7 @@ def task_summarize_run(**context):
 with DAG(
     dag_id="data_pipeline_daily_dev_v3",
     default_args=default_args,
-    schedule=None,  # 수동 실행 (원하면 cron으로 변경)
+    schedule=None,  # 수동 실행
     catchup=False,
     max_active_runs=1,
     tags=["data-pipeline", "dev", "mlops"],
