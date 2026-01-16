@@ -68,7 +68,7 @@ with DAG(
     )
 
     t_feast_materialize = BashOperator(
-        task_id="feast_materialize_incremental",
+        task_id="feast_materialize",
         bash_command="""
         set -euo pipefail
         cd /opt/airflow/dags/repo/dags/feast_repo
