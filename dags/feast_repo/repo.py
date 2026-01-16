@@ -4,7 +4,7 @@ from feast.infra.offline_stores.file_source import FileSource
 from feast.types import Int64, Float64
 
 user_features_source = FileSource(
-    path="s3://datapipeline-raw-data-keonho/feature-store/user_features/latest/features.csv",
+    path="s3://datapipeline-raw-data-keonho/feature-store/user_features/latest/features.parquet",
     timestamp_field=None,
     created_timestamp_column=None,
 )
