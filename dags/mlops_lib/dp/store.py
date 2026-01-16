@@ -94,11 +94,26 @@ def store_features(
     meta_bytes = meta_str.encode("utf-8")
     feat_csv_bytes = features_csv.encode("utf-8")
 
-    # ✅ CSV -> Parquet 변환 (pyarrow 설치 확인됨)
+    # ✅ CSV -> Parquet 변환 (Feast용: event_timestamp는 반드시 datetime 이어야 함)
     df = pd.read_csv(io.StringIO(features_csv))
+    
+    # 1) event_timestamp 없으면 "이번 실행 시각"으로 생성 (KST -> UTC)
+    if "event_timestamp" not in df.columns:
+        df["event_timestamp"] = pd.Timestamp.now(tz="Asia/Seoul").tz_convert("UTC")
+    else:
+        # 2) 문자열 -> datetime(UTC)로 강제 변환 (여기서 실패하면 데이터가 잘못된 것)
+        #    예: "2026-01-16T14:42:51.058240+09:00" 같은 값도 UTC로 정상 변환됨
+        df["event_timestamp"] = pd.to_datetime(df["event_timestamp"], utc=True, errors="raise")
+    
+    # (선택) 컬럼 순서 보기 좋게 정리 (Feast 쪽 가독성)
+    # event_timestamp를 마지막으로 두고 싶으면:
+    # cols = [c for c in df.columns if c != "event_timestamp"] + ["event_timestamp"]
+    # df = df[cols]
+    
     parquet_buf = io.BytesIO()
     df.to_parquet(parquet_buf, index=False)
     parquet_bytes = parquet_buf.getvalue()
+
 
     def _put(prefix: str):
         # CSV (디버깅/백업용)

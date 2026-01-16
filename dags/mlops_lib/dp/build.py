@@ -109,7 +109,7 @@ def build_features(
             "f_avg_session_sec_7d": (rec["sess_sum"] / rec["sess_cnt"]) if rec["sess_cnt"] > 0 else 0.0,
             "f_last_event_age_sec": int((now - rec["max_ts"]).total_seconds()) if rec["max_ts"] else 0,
             # ✅ Feast용 timestamp 컬럼
-            "event_timestamp": event_ts_iso,
+            "event_timestamp": now.isoformat(),
         }
         feature_rows.append([row_map.get(c, "") for c in cols])
 
