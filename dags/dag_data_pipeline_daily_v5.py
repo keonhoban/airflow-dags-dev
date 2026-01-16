@@ -72,7 +72,7 @@ with DAG(
         bash_command="""
         set -euo pipefail
         cd /opt/airflow/dags/repo/dags/feast_repo
-        feast materialize-incremental "{{ macros.ds_add(ds, -1) }}T00:00:00" "{{ ds }}T23:59:59"
+        feast materialize "{{ macros.ds_add(ds, -1) }}T00:00:00" "{{ ds }}T23:59:59"
         """.strip(),
     )
 
