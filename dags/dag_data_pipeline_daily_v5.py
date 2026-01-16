@@ -61,19 +61,19 @@ with DAG(
     t_feast_apply = BashOperator(
         task_id="feast_apply",
         bash_command="""
-set -euo pipefail
-cd /opt/airflow/dags/feast_repo
-feast apply
-""".strip(),
+        set -euo pipefail
+        cd /opt/airflow/dags/repo/dags/feast_repo
+        feast apply
+        """.strip(),
     )
 
     t_feast_materialize = BashOperator(
         task_id="feast_materialize_incremental",
         bash_command="""
-set -euo pipefail
-cd /opt/airflow/dags/feast_repo
-feast materialize-incremental "{{ macros.ds_add(ds, -1) }}T00:00:00" "{{ ds }}T23:59:59"
-""".strip(),
+        set -euo pipefail
+        cd /opt/airflow/dags/repo/dags/feast_repo
+        feast materialize-incremental "{{ macros.ds_add(ds, -1) }}T00:00:00" "{{ ds }}T23:59:59"
+        """.strip(),
     )
 
     t_summary = PythonOperator(
