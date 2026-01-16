@@ -35,10 +35,15 @@ def store_features(
 ) -> None:
     """
     XCom(build_features 결과) -> feature_base 아래로 저장
-    feature_base 예:
-      s3://bucket/features/feature-store
+
     저장 구조:
       <feature_base>/<feature_set>/<version>/
+        - features.csv
+        - schema.json
+        - metadata.json
+
+    + 고정 포인터:
+      <feature_base>/<feature_set>/latest/
         - features.csv
         - schema.json
         - metadata.json
@@ -59,10 +64,14 @@ def store_features(
     exec_date = getattr(ti, "execution_date", None)
     ver = _version_id(exec_date)
 
-    bkt, prefix = parse_s3_uri(feature_base)
-    prefix = prefix.rstrip("/") + f"/{feature_set}/{ver}/"
+    bkt, base_prefix = parse_s3_uri(feature_base)
+    base_prefix = base_prefix.rstrip("/") + f"/{feature_set}/"
 
-    feature_uri = f"s3://{bkt}/{prefix}features.csv"
+    ver_prefix = base_prefix + f"{ver}/"
+    latest_prefix = base_prefix + "latest/"
+
+    # feature_uri는 versioned를 기준으로 기록 (재현성)
+    feature_uri = f"s3://{bkt}/{ver_prefix}features.csv"
 
     tpl = Template(_read_local_text(metadata_tpl_path))
     meta_str = tpl.render(
@@ -75,27 +84,42 @@ def store_features(
         feature_set=feature_set,
     )
 
-    s3.put_object(
-        Bucket=bkt,
-        Key=f"{prefix}features.csv",
-        Body=features_csv.encode("utf-8"),
-        ContentType="text/csv",
-    )
-    s3.put_object(
-        Bucket=bkt,
-        Key=f"{prefix}schema.json",
-        Body=json.dumps(schema, ensure_ascii=False, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
-    s3.put_object(
-        Bucket=bkt,
-        Key=f"{prefix}metadata.json",
-        Body=meta_str.encode("utf-8"),
-        ContentType="application/json",
-    )
+    schema_bytes = json.dumps(schema, ensure_ascii=False, indent=2).encode("utf-8")
+    meta_bytes = meta_str.encode("utf-8")
+    feat_bytes = features_csv.encode("utf-8")
+
+    def _put(prefix: str):
+        s3.put_object(
+            Bucket=bkt,
+            Key=f"{prefix}features.csv",
+            Body=feat_bytes,
+            ContentType="text/csv",
+        )
+        s3.put_object(
+            Bucket=bkt,
+            Key=f"{prefix}schema.json",
+            Body=schema_bytes,
+            ContentType="application/json",
+        )
+        s3.put_object(
+            Bucket=bkt,
+            Key=f"{prefix}metadata.json",
+            Body=meta_bytes,
+            ContentType="application/json",
+        )
+
+    # 1) versioned 저장
+    _put(ver_prefix)
+
+    # 2) latest overwrite (Feast가 바라볼 고정 포인터)
+    _put(latest_prefix)
 
     ti.xcom_push(key="fs_version", value=ver)
-    ti.xcom_push(key="fs_prefix", value=f"s3://{bkt}/{prefix}")
+    ti.xcom_push(key="fs_prefix", value=f"s3://{bkt}/{ver_prefix}")
+    ti.xcom_push(key="fs_latest_prefix", value=f"s3://{bkt}/{latest_prefix}")
     ti.xcom_push(key="fs_feature_uri", value=feature_uri)
 
-    logger.info("[FS] store_features OK prefix=s3://%s/%s rows=%s", bkt, prefix, rows)
+    logger.info(
+        "[FS] store_features OK versioned=s3://%s/%s latest=s3://%s/%s rows=%s",
+        bkt, ver_prefix, bkt, latest_prefix, rows
+    )

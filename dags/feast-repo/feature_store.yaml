@@ -1,0 +1,9 @@
+project: feature_store_dev
+registry:
+  path: s3://datapipeline-raw-data-keonho/feast/dev/registry.pb
+provider: local
+offline_store:
+  type: file
+online_store:
+  type: redis
+  connection_string: redis.feature-store-dev.svc.cluster.local:6379
