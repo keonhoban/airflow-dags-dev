@@ -7,3 +7,4 @@ offline_store:
 online_store:
   type: redis
   connection_string: redis.feature-store-dev.svc.cluster.local:6379
+entity_key_serialization_version: 2

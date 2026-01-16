@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import json
+import io
 from datetime import datetime, timezone, timedelta
 from airflow.utils.log.logging_mixin import LoggingMixin
 from jinja2 import Template
 
-import pandas as pd  # ✅ 추가
-import io            # ✅ 추가
+import pandas as pd
 
 from .s3 import get_s3_client, parse_s3_uri
 
@@ -29,18 +29,6 @@ def _read_local_text(path: str) -> str:
         return f.read()
 
 
-def _csv_text_to_parquet_bytes(csv_text: str) -> bytes:
-    """
-    CSV 문자열 -> parquet bytes
-    - pyarrow가 설치되어 있으므로 pandas.to_parquet 사용 가능
-    - index는 저장하지 않음
-    """
-    df = pd.read_csv(io.StringIO(csv_text))
-    buf = io.BytesIO()
-    df.to_parquet(buf, index=False)  # engine=pyarrow (기본)
-    return buf.getvalue()
-
-
 def store_features(
     feature_base: str,
     pipeline_name: str,
@@ -54,14 +42,14 @@ def store_features(
     저장 구조:
       <feature_base>/<feature_set>/<version>/
         - features.csv
-        - features.parquet   ✅ 추가
+        - features.parquet
         - schema.json
         - metadata.json
 
     + 고정 포인터:
       <feature_base>/<feature_set>/latest/
         - features.csv
-        - features.parquet   ✅ 추가
+        - features.parquet
         - schema.json
         - metadata.json
     """
@@ -87,7 +75,7 @@ def store_features(
     ver_prefix = base_prefix + f"{ver}/"
     latest_prefix = base_prefix + "latest/"
 
-    # ✅ 재현성/표준: parquet를 기준 URI로 기록
+    # ✅ feature_uri는 versioned parquet 기준으로 기록 (재현성 + Feast 기준)
     feature_uri = f"s3://{bkt}/{ver_prefix}features.parquet"
 
     tpl = Template(_read_local_text(metadata_tpl_path))
@@ -101,29 +89,32 @@ def store_features(
         feature_set=feature_set,
     )
 
+    # bytes 준비
     schema_bytes = json.dumps(schema, ensure_ascii=False, indent=2).encode("utf-8")
     meta_bytes = meta_str.encode("utf-8")
     feat_csv_bytes = features_csv.encode("utf-8")
 
-    # ✅ parquet bytes 생성
-    feat_parquet_bytes = _csv_text_to_parquet_bytes(features_csv)
+    # ✅ CSV -> Parquet 변환 (pyarrow 설치 확인됨)
+    df = pd.read_csv(io.StringIO(features_csv))
+    parquet_buf = io.BytesIO()
+    df.to_parquet(parquet_buf, index=False)
+    parquet_bytes = parquet_buf.getvalue()
 
     def _put(prefix: str):
-        # CSV
+        # CSV (디버깅/백업용)
         s3.put_object(
             Bucket=bkt,
             Key=f"{prefix}features.csv",
             Body=feat_csv_bytes,
             ContentType="text/csv",
         )
-        # Parquet
+        # ✅ Parquet (Feast가 바라볼 표준)
         s3.put_object(
             Bucket=bkt,
             Key=f"{prefix}features.parquet",
-            Body=feat_parquet_bytes,
+            Body=parquet_bytes,
             ContentType="application/octet-stream",
         )
-        # schema / metadata
         s3.put_object(
             Bucket=bkt,
             Key=f"{prefix}schema.json",

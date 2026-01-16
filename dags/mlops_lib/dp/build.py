@@ -24,9 +24,18 @@ def build_features(
     """
     RAW S3 -> schema 기반 Feature 계산 -> XCom 저장
     - XCom에는 "features_csv"를 담습니다 (실무에서는 크기 커지면 S3 임시 저장으로 바꿉니다)
+
+    ✅ Feast를 위해 event_timestamp 컬럼을 추가합니다.
+    - schema에 없으면 자동으로 cols에 append
+    - 값은 KST now를 ISO-8601 형태로 넣습니다.
     """
     schema, schema_hash = load_schema(schema_path, expected_feature_set=feature_set)
     cols = [c["name"] for c in schema["columns"]]
+
+    # ✅ Feast apply에서 timestamp_field inference 실패 방지용
+    # schema에 event_timestamp가 없더라도 강제로 컬럼을 추가합니다.
+    if "event_timestamp" not in cols:
+        cols.append("event_timestamp")
 
     s3 = get_s3_client()
     bucket, key = parse_s3_uri(raw_path)
@@ -89,6 +98,9 @@ def build_features(
             if (rec["max_ts"] is None) or (ts > rec["max_ts"]):
                 rec["max_ts"] = ts
 
+    # ✅ Feast timestamp_field로 쓸 이벤트 타임스탬프 (KST, ISO-8601)
+    event_ts_iso = now.isoformat()
+
     feature_rows = []
     for uid, rec in by_user.items():
         row_map = {
@@ -96,6 +108,8 @@ def build_features(
             "f_total_events_7d": rec["cnt"],
             "f_avg_session_sec_7d": (rec["sess_sum"] / rec["sess_cnt"]) if rec["sess_cnt"] > 0 else 0.0,
             "f_last_event_age_sec": int((now - rec["max_ts"]).total_seconds()) if rec["max_ts"] else 0,
+            # ✅ Feast용 timestamp 컬럼
+            "event_timestamp": event_ts_iso,
         }
         feature_rows.append([row_map.get(c, "") for c in cols])
 
@@ -112,6 +126,6 @@ def build_features(
     ti.xcom_push(key="dp_raw_path", value=raw_path)  # downstream에서 source로 사용
 
     logger.info(
-        "[FS] build_features OK set=%s rows=%d schema_hash=%s",
-        feature_set, len(feature_rows), schema_hash
+        "[FS] build_features OK set=%s rows=%d schema_hash=%s event_timestamp=%s",
+        feature_set, len(feature_rows), schema_hash, event_ts_iso
     )
