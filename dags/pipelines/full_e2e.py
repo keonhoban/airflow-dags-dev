@@ -1,7 +1,7 @@
 # dags/pipelines/full_e2e.py
 from __future__ import annotations
 
-from airflow.sdk import Variable
+from airflow.models import Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.exceptions import AirflowSkipException
 
