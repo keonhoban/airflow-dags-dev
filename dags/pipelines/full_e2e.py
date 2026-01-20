@@ -1,7 +1,7 @@
 # dags/pipelines/full_e2e.py
 from __future__ import annotations
 
-from airflow.models import Variable
+from airflow.models import Variable  # ✅ FIX: use classic Variable API (supports default_var)
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.exceptions import AirflowSkipException
 
@@ -52,8 +52,13 @@ log = LoggingMixin().log
 # Helpers
 # -----------------------
 def get_param(key, default, cast_func, validate_func=None):
+    """
+    Variable을 환경별로 튜닝 가능하게 가져오되,
+    잘못된 값이면 Slack에 남기고 기본값 사용
+    """
     try:
-        v = cast_func(Variable.get(key, default=str(default)))
+        raw = Variable.get(key, default_var=str(default))  # ✅ classic Variable API
+        v = cast_func(raw)
         if validate_func and not validate_func(v):
             raise ValueError("Validation failed")
         return v
@@ -67,6 +72,11 @@ def get_version_by_alias(model_name, alias):
         return MlflowClient().get_model_version_by_alias(model_name, alias).version
     except Exception:
         return None
+
+
+def get_env():
+    # ✅ default_var 지원
+    return Variable.get("triton_env", default_var="dev")
 
 
 # -----------------------
@@ -99,9 +109,9 @@ def train_and_evaluate(ti, **_):
     max_iter = get_param("logreg_max_iter", 200, int, lambda x: x > 50)
     threshold = get_param("accuracy_threshold", 0.9, float, lambda x: 0.5 <= x <= 0.99)
 
-    model_name = Variable.get("model_name")
-    alias = Variable.get("mlflow_alias")
-    env = Variable.get("triton_env", default_var="dev")
+    model_name = Variable.get("model_name")     # 필수
+    alias = Variable.get("mlflow_alias")        # 필수
+    env = get_env()
 
     if not (model_name and alias):
         raise ValueError("필수 Variable 누락: model_name 또는 mlflow_alias")
@@ -109,7 +119,10 @@ def train_and_evaluate(ti, **_):
     feature_uri = ti.xcom_pull(task_ids="store_features", key="fs_feature_uri")
     fs_version = ti.xcom_pull(task_ids="store_features", key="fs_version")
     schema_hash = ti.xcom_pull(task_ids="build_features", key="fs_schema_hash")
-    rows = ti.xcom_pull(task_ids="build_features", key="fs_feature_rows") or ti.xcom_pull(task_ids="store_features", key="fs_feature_rows")
+    rows = (
+        ti.xcom_pull(task_ids="build_features", key="fs_feature_rows")
+        or ti.xcom_pull(task_ids="store_features", key="fs_feature_rows")
+    )
 
     if not feature_uri:
         raise ValueError("feature_uri 없음 → store_features 결과 확인 필요")
@@ -202,7 +215,7 @@ def register_model_task(ti, **_):
     run_id = ti.xcom_pull(task_ids="train_and_evaluate", key="run_id")
     model_name = ti.xcom_pull(task_ids="train_and_evaluate", key="model_name")
     alias = ti.xcom_pull(task_ids="train_and_evaluate", key="alias")
-    env = Variable.get("triton_env", default_var="dev")
+    env = get_env()
 
     prev_version = get_version_by_alias(model_name, alias)
 
@@ -243,11 +256,11 @@ def triton_rollback_task(ti, **_):
 # -----------------------
 def fastapi_reload_task(ti, **_):
     alias = ti.xcom_pull(task_ids="train_and_evaluate", key="alias")
-    env = Variable.get("triton_env", default_var="dev")
+    env = get_env()
     trigger_reload(alias)
     notify_success("FastAPI reload completed", env=env, alias=alias)
 
 
 def notify_failure():
-    env = Variable.get("triton_env", default_var="dev")
+    env = get_env()
     notify_skip("Accuracy below threshold", env=env, next_action="특성/라벨/모델 파라미터 개선")
