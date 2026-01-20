@@ -1,7 +1,7 @@
 # dags/pipelines/full_e2e.py
 from __future__ import annotations
 
-from airflow.models import Variable  # ✅ FIX: use classic Variable API (supports default_var)
+from airflow.models import Variable  # classic Variable API
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.exceptions import AirflowSkipException
 
@@ -57,7 +57,7 @@ def get_param(key, default, cast_func, validate_func=None):
     잘못된 값이면 Slack에 남기고 기본값 사용
     """
     try:
-        raw = Variable.get(key, default_var=str(default))  # ✅ classic Variable API
+        raw = Variable.get(key, default_var=str(default))
         v = cast_func(raw)
         if validate_func and not validate_func(v):
             raise ValueError("Validation failed")
@@ -75,7 +75,6 @@ def get_version_by_alias(model_name, alias):
 
 
 def get_env():
-    # ✅ default_var 지원
     return Variable.get("triton_env", default_var="dev")
 
 
@@ -85,14 +84,18 @@ def get_env():
 def dp_extract(**context):
     return task_extract_raw_data(**context)
 
+
 def dp_validate(**context):
     return task_validate_data(**context)
+
 
 def dp_build(**context):
     return task_build_features(**context)
 
+
 def dp_store(**context):
     return task_store_features(**context)
+
 
 def dp_summary(**context):
     return task_summarize_run(**context)
@@ -109,8 +112,8 @@ def train_and_evaluate(ti, **_):
     max_iter = get_param("logreg_max_iter", 200, int, lambda x: x > 50)
     threshold = get_param("accuracy_threshold", 0.9, float, lambda x: 0.5 <= x <= 0.99)
 
-    model_name = Variable.get("model_name")     # 필수
-    alias = Variable.get("mlflow_alias")        # 필수
+    model_name = Variable.get("model_name")  # 필수
+    alias = Variable.get("mlflow_alias")     # 필수
     env = get_env()
 
     if not (model_name and alias):
@@ -164,7 +167,6 @@ def train_and_evaluate(ti, **_):
         )
         raise AirflowSkipException(str(e))
     except ValueError as e:
-        # sklearn 단일 클래스 같은 케이스 안전망
         msg = str(e)
         if "at least 2 classes" in msg:
             notify_skip(
@@ -181,11 +183,15 @@ def train_and_evaluate(ti, **_):
             raise AirflowSkipException(msg)
         raise
 
+    # XCom
     ti.xcom_push(key="run_id", value=run_id)
     ti.xcom_push(key="model_name", value=model_name)
     ti.xcom_push(key="alias", value=alias)
     ti.xcom_push(key="acc", value=acc)
     ti.xcom_push(key="threshold", value=threshold)
+
+    # (선택) shadow smoke에서 참고용으로 남겨두기
+    ti.xcom_push(key="feature_uri", value=feature_uri)
 
     notify_success(
         "Train completed",
@@ -208,7 +214,8 @@ def check_result(ti, **_):
         send_slack_alert("⏭️ check_result: train이 SKIP 되었거나 XCom 누락 → 분기 스킵")
         raise AirflowSkipException()
 
-    return "register_model_task" if acc >= threshold else "notify_failure"
+    # ✅ 성능 통과면 promotion(등록) / 미달이면 shadow로 끝까지 검증
+    return "register_model_task" if acc >= threshold else "shadow_start"
 
 
 def register_model_task(ti, **_):
@@ -244,8 +251,39 @@ def sensor_ready_func(ti, **_):
 # Triton deploy
 # -----------------------
 def triton_materialize_task(ti, **_):
+    """
+    ✅ 실무형:
+    - register 성공(=version 존재) -> Promotion 경로: alias 기준 materialize
+    - register 스킵/미실행 -> Shadow 경로: run_id 기준 materialize (pipeline 끝까지 검증)
+    """
     alias = ti.xcom_pull(task_ids="train_and_evaluate", key="alias")
-    materialize(ti=ti, alias=alias)
+    run_id = ti.xcom_pull(task_ids="train_and_evaluate", key="run_id")
+    env = get_env()
+
+    version = ti.xcom_pull(task_ids="register_model_task", key="version")
+
+    if version:
+        notify_info(
+            "Triton deploy: promotion path (alias)",
+            env=env,
+            alias=alias,
+            version=str(version),
+        )
+        materialize(ti=ti, alias=alias)
+        return
+
+    # shadow
+    if not run_id:
+        raise ValueError("Shadow deploy 불가: run_id XCom 누락 (train_and_evaluate 확인 필요)")
+
+    notify_info(
+        "Triton deploy: shadow path (run_id)",
+        env=env,
+        alias=alias,
+        run_id=run_id,
+    )
+    materialize(ti=ti, alias=alias, run_id=run_id, shadow=True)
+
 
 def triton_rollback_task(ti, **_):
     rollback_minimal(ti=ti)
@@ -262,5 +300,10 @@ def fastapi_reload_task(ti, **_):
 
 
 def notify_failure():
+    """
+    accuracy 미달 시:
+    - 프로모션(register)은 스킵
+    - 하지만 (구성에 따라) shadow deploy + smoke까지는 여전히 수행 가능
+    """
     env = get_env()
     notify_skip("Accuracy below threshold", env=env, next_action="특성/라벨/모델 파라미터 개선")

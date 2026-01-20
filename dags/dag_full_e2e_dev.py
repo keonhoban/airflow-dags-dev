@@ -7,6 +7,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.bash import BashOperator
 from airflow.sensors.python import PythonSensor
+from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
 
 from utils.slack_alerts import alert_slack
@@ -77,7 +78,7 @@ with DAG(
     )
 
     # -----------------------
-    # Train/Register
+    # Train / Branch
     # -----------------------
     train = PythonOperator(
         task_id="train_and_evaluate",
@@ -86,9 +87,12 @@ with DAG(
 
     branch = BranchPythonOperator(
         task_id="check_result",
-        python_callable=p.check_result,
+        python_callable=p.check_result,  # success면 register_model_task / fail이면 shadow_start
     )
 
+    # -----------------------
+    # Promotion path
+    # -----------------------
     register = PythonOperator(
         task_id="register_model_task",
         python_callable=p.register_model_task,
@@ -102,49 +106,61 @@ with DAG(
         mode="reschedule",
     )
 
-    failure = PythonOperator(
+    promotion_start = EmptyOperator(task_id="promotion_start")
+    shadow_start = EmptyOperator(task_id="shadow_start")
+
+    notify_failure = PythonOperator(
         task_id="notify_failure",
-        python_callable=p.notify_failure,
+        python_callable=p.notify_failure,  # Slack에 accuracy 미달 남김
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     # -----------------------
-    # Triton deploy
+    # Common deploy (검증까지)
     # -----------------------
     snap = PythonOperator(
         task_id="snapshot_current",
         python_callable=p.snapshot_current,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     mat = PythonOperator(
         task_id="materialize_repo",
         python_callable=p.triton_materialize_task,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     load = PythonOperator(
         task_id="triton_load",
         python_callable=p.triton_load,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
     ready = PythonOperator(
         task_id="triton_ready",
         python_callable=p.triton_ready,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
     smoke = PythonOperator(
         task_id="triton_infer_smoke",
         python_callable=p.triton_infer_smoke,
-    )
-
-    commit = PythonOperator(
-        task_id="commit_current",
-        python_callable=p.commit_current,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
     rb = PythonOperator(
         task_id="rollback_minimal",
         python_callable=p.triton_rollback_task,
         trigger_rule=TriggerRule.ONE_FAILED,
+    )
+
+    # -----------------------
+    # Promotion-only (상태 갱신)
+    # -----------------------
+    commit = PythonOperator(
+        task_id="commit_current",
+        python_callable=p.commit_current,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
     fastapi_reload = PythonOperator(
@@ -156,9 +172,30 @@ with DAG(
     # -----------------------
     # Dependencies
     # -----------------------
+    # DP
     extract_raw_data >> validate_data >> build_features >> store_features >> feast_apply >> feast_materialize
+
+    # Train & branch
     feast_materialize >> train >> branch
-    branch >> [register, failure]
-    register >> sensor >> snap >> mat >> load >> ready >> smoke >> commit >> fastapi_reload
+
+    # Branch outcomes
+    branch >> register >> promotion_start
+    branch >> shadow_start >> notify_failure
+
+    # Promotion path continues
+    promotion_start >> sensor >> snap
+
+    # Shadow path continues (register 없이도 deploy 검증)
+    shadow_start >> snap
+
+    # Common deploy chain (검증까지는 둘 다 수행)
+    snap >> mat >> load >> ready >> smoke
+
+    # Promotion-only state changes
+    smoke >> commit >> fastapi_reload
+
+    # Rollback on failure
     [mat, load, ready, smoke, commit] >> rb
-    [feast_materialize, fastapi_reload, rb, failure] >> summarize_run
+
+    # Summary
+    [feast_materialize, fastapi_reload, rb, notify_failure] >> summarize_run

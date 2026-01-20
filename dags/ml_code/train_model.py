@@ -73,13 +73,26 @@ def _make_label(df: pd.DataFrame, q: int = 3) -> pd.Series:
 
 
 def export_onnx_and_log_artifact(clf, n_features: int):
-    """runs:/<run_id>/onnx/model.onnx 로 항상 저장 + zipmap 비활성화"""
+    """
+    runs:/<run_id>/onnx/model.onnx 로 항상 저장 + zipmap 비활성화
+    + ✅ ONNX 입출력 메타(이름/차원)를 MLflow param으로 기록
+    """
     initial_type = [("input", FloatTensorType([None, n_features]))]
     onnx_model = convert_sklearn(
         clf,
         initial_types=initial_type,
         options={id(clf): {"zipmap": False}},
     )
+
+    # ✅ ONNX IO 이름 추출
+    try:
+        in_name = onnx_model.graph.input[0].name
+        out_names = [o.name for o in onnx_model.graph.output]
+        mlflow.log_param("onnx_input_name", in_name)
+        mlflow.log_param("onnx_output_names", ",".join(out_names))
+        logger.info("[ONNX] io names input=%s output=%s", in_name, out_names)
+    except Exception as e:
+        logger.warning("[ONNX] failed to extract io names: %s", e)
 
     onnx_path = "/tmp/model.onnx"
     with open(onnx_path, "wb") as f:
@@ -140,6 +153,8 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
         mlflow.log_param("feature_uri", feature_uri)
         mlflow.log_param("train_rows", len(df))
         mlflow.log_param("train_classes", ",".join(map(str, uniq)))
+        mlflow.log_param("n_features", X.shape[1])     # ✅ Triton config 자동화 핵심
+        mlflow.log_param("n_classes", len(uniq))       # ✅ Triton config 자동화 핵심
         if fs_version:
             mlflow.log_param("fs_version", fs_version)
         if schema_hash:
@@ -150,5 +165,8 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
         mlflow.sklearn.log_model(clf, "model")
         export_onnx_and_log_artifact(clf, n_features=X.shape[1])
 
-        logger.info("[TRAIN] acc=%.4f feature_uri=%s fs_version=%s schema_hash=%s", acc, feature_uri, fs_version, schema_hash)
+        logger.info(
+            "[TRAIN] acc=%.4f feature_uri=%s fs_version=%s schema_hash=%s n_features=%d n_classes=%d",
+            acc, feature_uri, fs_version, schema_hash, X.shape[1], len(uniq)
+        )
         return acc, run_id
