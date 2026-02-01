@@ -17,6 +17,7 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=3),
 }
 
+# ---- Config (Airflow Variables로 튜닝 가능) ----
 FEAST_IMAGE = Variable.get("FEAST_IMAGE", default_var="hoizz/feast-server:0.40.1-s3fs")
 AWS_REGION = Variable.get("AWS_REGION", default_var="ap-northeast-2")
 FEAST_REPO_CONFIGMAP = Variable.get("FEAST_REPO_CONFIGMAP", default_var="feast-repo")
@@ -29,13 +30,12 @@ AWS_PROFILE_PROD = Variable.get("FEAST_AWS_PROFILE_PROD", default_var="rotator-p
 
 FEAST_FULL_START = Variable.get("FEAST_FULL_START", default_var="2026-01-01T00:00:00")
 
-# fsnotify/FD 한계 완화 (필요시 Airflow Variable로 튜닝)
 ULIMIT_NOFILE = int(Variable.get("FEAST_ULIMIT_NOFILE", default_var="8192"))
 
 Mode = Literal["incremental", "full"]
 
 
-def _build_repo_volumes(*, repo_configmap_name: str):
+def _repo_volumes(repo_configmap_name: str):
     vol_repo_src = k8s.V1Volume(
         name="feast-repo-src",
         config_map=k8s.V1ConfigMapVolumeSource(name=repo_configmap_name),
@@ -55,13 +55,14 @@ def _build_repo_volumes(*, repo_configmap_name: str):
         mount_path="/feast-repo",
         read_only=False,
     )
+
     return [vol_repo_src, vol_repo_work], [vm_repo_src, vm_repo_work]
 
 
-def _build_aws_cred_volume(*, aws_cred_secret_name: str):
+def _aws_cred_volume(secret_name: str):
     vol_aws = k8s.V1Volume(
         name="aws-credentials",
-        secret=k8s.V1SecretVolumeSource(secret_name=aws_cred_secret_name),
+        secret=k8s.V1SecretVolumeSource(secret_name=secret_name),
     )
     vm_aws = k8s.V1VolumeMount(
         name="aws-credentials",
@@ -71,35 +72,40 @@ def _build_aws_cred_volume(*, aws_cred_secret_name: str):
     return vol_aws, vm_aws
 
 
-def _build_cmd(*, mode: Mode, full_start: str) -> str:
+def _build_script(mode: Mode, full_start: str) -> str:
     """
+    핵심 목표:
+    - /bin/sh 환경에서도 깨지지 않기 (pipefail 금지)
+    - bash가 있으면 pipefail 활성화 (자동 폴백)
     - ConfigMap atomic writer(..data) 오염 방지
-    - 문자열 결합으로 커맨드가 붙는 사고(apply#) 재발 방지: 항상 라인 단위 join
-    - fsnotify open files 완화: ulimit (가능하면)
+    - 커맨드 붙는 사고 방지: 라인 join
     """
     lines: list[str] = [
-        "set -euo pipefail",
+        # 1) bash 존재하면 bash로 재실행 (pipefail 가능), 아니면 sh로 계속
+        'if command -v bash >/dev/null 2>&1; then exec bash -lc "$0"; fi',
+        "",
+        # 2) sh 안전 옵션 (pipefail 없음)
+        "set -eu",
         "set -x",
         "",
+        # 3) ulimit (가능하면)
         f"ulimit -n {ULIMIT_NOFILE} || true",
         "",
-        # workdir 완전 정리 (숨김 포함)
+        # 4) workdir 정리
         "find /feast-repo -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
         "",
-        # ConfigMap -> workdir 복사
-        # '/.' 금지: ..data/..timestamp 유입 가능
+        # 5) ConfigMap -> workdir 복사
         "cp -aL /feast-repo-src/* /feast-repo/",
         "",
-        # 방어: atomic writer 디렉토리 유입 시 즉시 실패
+        # 6) 방어
         "test ! -e /feast-repo/..data",
-        "",
         "ls -al /feast-repo",
         "test -f /feast-repo/feature_store.yaml",
         "test -f /feast-repo/repo.py",
         "",
         "cd /feast-repo",
         "",
-        # ✅ 반드시 단독 라인 (apply# 사고 재발 방지)
+        # 7) Feast apply (단독 라인)
         "feast apply",
         "",
     ]
@@ -109,7 +115,7 @@ def _build_cmd(*, mode: Mode, full_start: str) -> str:
             "# incremental: 마지막 materialize 시점부터 now까지",
             'feast materialize-incremental "$(date -u +"%Y-%m-%dT%H:%M:%S")"',
         ]
-    elif mode == "full":
+    else:
         lines += [
             "# full refresh: START -> now",
             f'START="{full_start}"',
@@ -117,10 +123,7 @@ def _build_cmd(*, mode: Mode, full_start: str) -> str:
             'echo "materialize $START -> $END"',
             'feast materialize "$START" "$END"',
         ]
-    else:
-        raise ValueError(f"unknown mode: {mode}")
 
-    # join으로만 합치면 커맨드가 붙을 일이 없습니다.
     return "\n".join(lines) + "\n"
 
 
@@ -129,15 +132,16 @@ def _feast_task(
     dag: DAG,
     task_id: str,
     namespace: str,
-    aws_cred_secret_name: str,
+    aws_secret: str,
     aws_profile: str,
     mode: Mode,
 ) -> KubernetesPodOperator:
-    volumes_repo, mounts_repo = _build_repo_volumes(repo_configmap_name=FEAST_REPO_CONFIGMAP)
-    vol_aws, vm_aws = _build_aws_cred_volume(aws_cred_secret_name=aws_cred_secret_name)
+    repo_vols, repo_mounts = _repo_volumes(FEAST_REPO_CONFIGMAP)
+    vol_aws, vm_aws = _aws_cred_volume(aws_secret)
 
-    cmd = _build_cmd(mode=mode, full_start=FEAST_FULL_START)
+    script = _build_script(mode=mode, full_start=FEAST_FULL_START)
 
+    # /bin/sh로 실행하되, 스크립트 첫 줄에서 bash 있으면 자동으로 bash로 재실행
     return KubernetesPodOperator(
         dag=dag,
         task_id=task_id,
@@ -145,15 +149,15 @@ def _feast_task(
         namespace=namespace,
         image=FEAST_IMAGE,
         cmds=["/bin/sh", "-c"],
-        arguments=[cmd],
+        arguments=[script],
         env_vars={
             "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
             "AWS_PROFILE": aws_profile,
             "AWS_DEFAULT_REGION": AWS_REGION,
             "AWS_REGION": AWS_REGION,
         },
-        volumes=[*volumes_repo, vol_aws],
-        volume_mounts=[*mounts_repo, vm_aws],
+        volumes=[*repo_vols, vol_aws],
+        volume_mounts=[*repo_mounts, vm_aws],
         get_logs=True,
         is_delete_operator_pod=True,
         startup_timeout_seconds=300,
@@ -172,7 +176,7 @@ with DAG(
         dag=dag,
         task_id="feast_dev_incremental",
         namespace="feature-store-dev",
-        aws_cred_secret_name=AWS_CRED_SECRET_DEV,
+        aws_secret=AWS_CRED_SECRET_DEV,
         aws_profile=AWS_PROFILE_DEV,
         mode="incremental",
     )
@@ -181,7 +185,7 @@ with DAG(
         dag=dag,
         task_id="feast_prod_incremental",
         namespace="feature-store-prod",
-        aws_cred_secret_name=AWS_CRED_SECRET_PROD,
+        aws_secret=AWS_CRED_SECRET_PROD,
         aws_profile=AWS_PROFILE_PROD,
         mode="incremental",
     )
@@ -201,7 +205,7 @@ with DAG(
         dag=dag_full,
         task_id="feast_dev_full_refresh",
         namespace="feature-store-dev",
-        aws_cred_secret_name=AWS_CRED_SECRET_DEV,
+        aws_secret=AWS_CRED_SECRET_DEV,
         aws_profile=AWS_PROFILE_DEV,
         mode="full",
     )
@@ -210,7 +214,7 @@ with DAG(
         dag=dag_full,
         task_id="feast_prod_full_refresh",
         namespace="feature-store-prod",
-        aws_cred_secret_name=AWS_CRED_SECRET_PROD,
+        aws_secret=AWS_CRED_SECRET_PROD,
         aws_profile=AWS_PROFILE_PROD,
         mode="full",
     )
