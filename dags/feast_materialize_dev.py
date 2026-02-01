@@ -10,26 +10,17 @@ from kubernetes.client import models as k8s
 
 KST = pendulum.timezone("Asia/Seoul")
 
-# =========================
-# ✅ 운영/면접/유지보수 기준: 바뀔만한 값만 상수로 고정
-# =========================
+# ---- 고정 값 (면접/유지보수 관점: 옵션 최소화) ----
 NAMESPACE = "feature-store-dev"
 
 FEAST_IMAGE = "hoizz/feast-server:0.40.1-s3fs"
+FEAST_REPO_CONFIGMAP = "feast-repo"           # feature_store.yaml + repo.py
+AWS_CRED_SECRET = "aws-credentials-secret"    # /root/.aws/credentials
 
-# ConfigMap: feature_store.yaml + repo.py 포함
-FEAST_REPO_CONFIGMAP = "feast-repo"
-
-# AWS credentials secret: /root/.aws/credentials 로 마운트
-AWS_CRED_SECRET = "aws-credentials-secret"
-AWS_PROFILE = "rotator-dev"
 AWS_REGION = "ap-northeast-2"
+AWS_PROFILE = "rotator-dev"
 
-# Full refresh 시작점 (복구/초기화용)
-FULL_REFRESH_START_ISO = "2026-01-01T00:00:00"
-
-# 30분 주기 incremental
-SCHEDULE = "*/30 * * * *"
+FULL_REFRESH_START = "2026-01-01T00:00:00"
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -37,13 +28,8 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=3),
 }
 
-
-# =========================
-# K8s volumes
-# - ConfigMap은 ..data/..timestamp atomic writer 구조가 있어
-#   emptyDir에 복사 후 실행
-# =========================
 def _repo_volumes():
+    # ConfigMap은 ..data 등 atomic-writer 구조가 섞일 수 있어 emptyDir로 복사 후 실행
     vol_src = k8s.V1Volume(
         name="feast-repo-src",
         config_map=k8s.V1ConfigMapVolumeSource(name=FEAST_REPO_CONFIGMAP),
@@ -63,9 +49,7 @@ def _repo_volumes():
         mount_path="/repo",
         read_only=False,
     )
-
     return [vol_src, vol_work], [vm_src, vm_work]
-
 
 def _aws_cred_volume():
     vol = k8s.V1Volume(
@@ -79,24 +63,15 @@ def _aws_cred_volume():
     )
     return vol, vm
 
-
-# =========================
-# sh-safe scripts
-# - dotfile(..data 등) 복사 방지
-# - symlink 실체화(-L)
-# =========================
-def _script_common_preamble() -> str:
-    return r"""
+def _script(mode: str) -> str:
+    # /bin/sh 기준, dotfile/hidden copy 방지(*), symlink 실체화(-L)
+    base = r"""
 set -eu
-set -x
 
-# workdir clean
 rm -rf /repo/* || true
 
-# ✅ 핵심: ConfigMap mount의 숨김 디렉토리(..data, ..2026_...)는 복사하지 않기
-# - * 로 dotfile 제외
-# - -L 로 symlink 실체화
-cp -aL /repo-src/* /repo/
+# dotfile 제외 + symlink 실체화
+cp -aL /repo-src/* /repo/ || true
 
 # 혹시 남아있으면 제거(안전망)
 find /repo -maxdepth 1 -name '..*' -exec rm -rf {} + || true
@@ -104,35 +79,23 @@ find /repo -maxdepth 1 -name '..*' -exec rm -rf {} + || true
 cd /repo
 test -f feature_store.yaml
 test -f repo.py
-""".strip()
-
-
-def _script_incremental() -> str:
-    return (
-        _script_common_preamble()
-        + r"""
 
 feast apply
-feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')"
 """.strip()
-    )
 
-
-def _script_full(start_iso: str) -> str:
-    return (
-        _script_common_preamble()
-        + rf"""
-
-feast apply
-START="{start_iso}"
+    if mode == "incremental":
+        return (base + "\n" + r"""feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')" """.strip())
+    elif mode == "full":
+        return (base + "\n" + rf"""
+START="{FULL_REFRESH_START}"
 END="$(date -u +'%Y-%m-%dT%H:%M:%S')"
 echo "materialize $START -> $END"
 feast materialize "$START" "$END"
-""".strip()
-    )
+""".strip())
+    else:
+        raise ValueError(f"invalid mode: {mode}")
 
-
-def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
+def _kpo(task_id: str, mode: str) -> KubernetesPodOperator:
     repo_vols, repo_mounts = _repo_volumes()
     aws_vol, aws_mount = _aws_cred_volume()
 
@@ -142,7 +105,7 @@ def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
         namespace=NAMESPACE,
         image=FEAST_IMAGE,
         cmds=["/bin/sh", "-c"],
-        arguments=[script],
+        arguments=[_script(mode)],
         env_vars={
             "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
             "AWS_PROFILE": AWS_PROFILE,
@@ -156,31 +119,25 @@ def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
         startup_timeout_seconds=300,
     )
 
-
-# =========================
-# DAG 1) Incremental (주기)
-# =========================
+# 1) 30분마다 incremental
 with DAG(
     dag_id="feast_materialize_dev",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
-    schedule=SCHEDULE,
+    schedule="*/30 * * * *",
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["feast", "feature-store", "dev"],
+    tags=["feature-store", "feast", "dev"],
 ) as dag:
-    _kpo("feast_materialize_incremental", _script_incremental())
+    _kpo("feast_materialize_incremental", mode="incremental")
 
-
-# =========================
-# DAG 2) Full refresh (수동)
-# =========================
+# 2) 수동 full refresh (복구/초기화)
 with DAG(
     dag_id="feast_full_refresh_dev_manual",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
     schedule=None,
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["feast", "feature-store", "dev", "recovery"],
+    tags=["feature-store", "feast", "dev", "recovery"],
 ) as dag_full:
-    _kpo("feast_materialize_full", _script_full(start_iso=FULL_REFRESH_START_ISO))
+    _kpo("feast_materialize_full", mode="full")
 
