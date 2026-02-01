@@ -1,105 +1,172 @@
+# dags/e2e_full.py
 from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pendulum import timezone
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.sensors.python import PythonSensor
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
-from datetime import datetime, timedelta
 
-from pipelines.e2e_pipeline import (
-    dp_build_and_store,
-    train_and_log,
-    branch_on_accuracy,
-    register_and_alias,
-    wait_model_ready,
-    triton_snapshot_current,
-    triton_materialize_and_smoke,
-    triton_commit_current,
-    triton_rollback_minimal,
-    fastapi_reload,
-    notify_shadow_skip,
-)
+from utils.slack_alerts import alert_slack
+from pipelines import full_e2e as p
 
+kst = timezone("Asia/Seoul")
 default_args = {
-    "owner": "mlops",
+    "start_date": datetime(2025, 1, 1, tzinfo=kst),
     "retries": 1,
-    "retry_delay": timedelta(minutes=3),
+    "retry_delay": timedelta(minutes=2),
 }
 
 with DAG(
     dag_id="e2e_full",
-    start_date=datetime(2025, 1, 1),
+    default_args=default_args,
     schedule=None,
     catchup=False,
-    default_args=default_args,
-    dagrun_timeout=timedelta(hours=2),
-    tags=["mlops", "e2e"],
+    max_active_runs=1,
+    tags=["e2e", "mlops", "triton", "mlflow"],
+    on_failure_callback=alert_slack,
 ) as dag:
-    start = EmptyOperator(task_id="start")
 
-    dp = PythonOperator(
-        task_id="dp_build_and_store",
-        python_callable=dp_build_and_store,
+    # -----------------------
+    # Data pipeline (Feature Store-lite)
+    # -----------------------
+    extract_raw_data = PythonOperator(
+        task_id="extract_raw_data",
+        python_callable=p.dp_extract,
     )
 
+    validate_data = PythonOperator(
+        task_id="validate_data",
+        python_callable=p.dp_validate,
+    )
+
+    build_features = PythonOperator(
+        task_id="build_features",
+        python_callable=p.dp_build,
+    )
+
+    store_features = PythonOperator(
+        task_id="store_features",
+        python_callable=p.dp_store,
+    )
+
+    summarize_run = PythonOperator(
+        task_id="summarize_run",
+        python_callable=p.dp_summary,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    # -----------------------
+    # Train / Branch
+    # -----------------------
     train = PythonOperator(
-        task_id="train_and_log",
-        python_callable=train_and_log,
+        task_id="train_and_evaluate",
+        python_callable=p.train_and_evaluate,
     )
 
     branch = BranchPythonOperator(
-        task_id="branch_on_accuracy",
-        python_callable=branch_on_accuracy,
+        task_id="check_result",
+        python_callable=p.check_result,  # pass -> register_path / fail -> shadow_path
     )
 
-    shadow = PythonOperator(
-        task_id="shadow_start",
-        python_callable=notify_shadow_skip,
-    )
-
+    # -----------------------
+    # Promotion path
+    # -----------------------
     register = PythonOperator(
-        task_id="register_and_alias",
-        python_callable=register_and_alias,
+        task_id="register_model_task",
+        python_callable=p.register_model_task,
     )
 
-    sensor = PythonOperator(
-        task_id="wait_model_ready",
-        python_callable=wait_model_ready,
+    sensor = PythonSensor(
+        task_id="check_model_ready",
+        python_callable=p.sensor_ready_func,
+        poke_interval=10,
+        timeout=180,
+        mode="reschedule",
     )
 
+    promotion_start = EmptyOperator(task_id="promotion_start")
+    shadow_start = EmptyOperator(task_id="shadow_start")
+
+    notify_failure = PythonOperator(
+        task_id="notify_failure",
+        python_callable=p.notify_failure,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+
+    # -----------------------
+    # Common deploy chain (both paths)
+    # -----------------------
     snap = PythonOperator(
-        task_id="triton_snapshot_current",
-        python_callable=triton_snapshot_current,
+        task_id="snapshot_current",
+        python_callable=p.snapshot_current,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    deploy_smoke = PythonOperator(
-        task_id="triton_materialize_and_smoke",
-        python_callable=triton_materialize_and_smoke,
+    mat = PythonOperator(
+        task_id="materialize_repo",
+        python_callable=p.triton_materialize_task,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    commit = PythonOperator(
-        task_id="triton_commit_current",
-        python_callable=triton_commit_current,
+    load = PythonOperator(
+        task_id="triton_load",
+        python_callable=p.triton_load,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
-    reload_api = PythonOperator(
-        task_id="fastapi_reload",
-        python_callable=fastapi_reload,
+    ready = PythonOperator(
+        task_id="triton_ready",
+        python_callable=p.triton_ready,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
-    rollback = PythonOperator(
-        task_id="triton_rollback_minimal",
-        python_callable=triton_rollback_minimal,
+    smoke = PythonOperator(
+        task_id="triton_infer_smoke",
+        python_callable=p.triton_infer_smoke,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    rb = PythonOperator(
+        task_id="rollback_minimal",
+        python_callable=p.triton_rollback_task,
         trigger_rule=TriggerRule.ONE_FAILED,
     )
 
-    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    # -----------------------
+    # Promotion-only state changes
+    # -----------------------
+    commit = PythonOperator(
+        task_id="commit_current",
+        python_callable=p.commit_current,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
 
-    start >> dp >> train >> branch
-    branch >> register >> sensor >> snap >> deploy_smoke >> commit >> reload_api >> end
+    fastapi_reload = PythonOperator(
+        task_id="fastapi_reload",
+        python_callable=p.fastapi_reload_task,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
 
-    branch >> shadow >> end
+    # -----------------------
+    # Dependencies
+    # -----------------------
+    extract_raw_data >> validate_data >> build_features >> store_features
+    store_features >> train >> branch
 
-    # 실패 시 롤백(프로모션 경로에서만 의미 있음)
-    [snap, deploy_smoke, commit, reload_api] >> rollback >> end
+    branch >> register >> promotion_start
+    branch >> shadow_start >> notify_failure
+
+    promotion_start >> sensor >> snap
+    shadow_start >> snap
+
+    snap >> mat >> load >> ready >> smoke
+
+    smoke >> commit >> fastapi_reload
+
+    [mat, load, ready, smoke, commit] >> rb
+    [store_features, fastapi_reload, rb, notify_failure] >> summarize_run
 
