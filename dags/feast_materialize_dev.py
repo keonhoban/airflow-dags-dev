@@ -10,16 +10,15 @@ from kubernetes.client import models as k8s
 
 KST = pendulum.timezone("Asia/Seoul")
 
-# ---- 고정 값 (면접/유지보수 관점: 옵션 최소화) ----
+# ---- 고정 값 (서류/면접/유지보수 관점: 옵션 최소화) ----
 NAMESPACE = "feature-store-dev"
 
 FEAST_IMAGE = "hoizz/feast-server:0.40.1-s3fs"
-FEAST_REPO_CONFIGMAP = "feast-repo"           # feature_store.yaml + repo.py
-AWS_CRED_SECRET = "aws-credentials-secret"    # /root/.aws/credentials
+FEAST_REPO_CONFIGMAP = "feast-repo"           # ✅ helm이 만드는 CM 이름 고정
+AWS_CRED_SECRET = "aws-credentials-secret"    # ✅ 실제 secretName과 통일
 
 AWS_REGION = "ap-northeast-2"
 AWS_PROFILE = "rotator-dev"
-
 FULL_REFRESH_START = "2026-01-01T00:00:00"
 
 DEFAULT_ARGS = {
@@ -29,7 +28,7 @@ DEFAULT_ARGS = {
 }
 
 def _repo_volumes():
-    # ConfigMap은 ..data 등 atomic-writer 구조가 섞일 수 있어 emptyDir로 복사 후 실행
+    # ConfigMap atomic writer(..data 등) 섞일 수 있어 work(emptyDir)로 복사 후 실행
     vol_src = k8s.V1Volume(
         name="feast-repo-src",
         config_map=k8s.V1ConfigMapVolumeSource(name=FEAST_REPO_CONFIGMAP),
@@ -64,13 +63,12 @@ def _aws_cred_volume():
     return vol, vm
 
 def _script(mode: str) -> str:
-    # /bin/sh 기준, dotfile/hidden copy 방지(*), symlink 실체화(-L)
     base = r"""
 set -eu
 
 rm -rf /repo/* || true
 
-# dotfile 제외 + symlink 실체화
+# dotfile 제외(*) + symlink 실체화(-L)
 cp -aL /repo-src/* /repo/ || true
 
 # 혹시 남아있으면 제거(안전망)
@@ -84,16 +82,16 @@ feast apply
 """.strip()
 
     if mode == "incremental":
-        return (base + "\n" + r"""feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')" """.strip())
-    elif mode == "full":
-        return (base + "\n" + rf"""
+        return base + "\n" + r"""feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')" """
+    if mode == "full":
+        return base + "\n" + rf"""
 START="{FULL_REFRESH_START}"
 END="$(date -u +'%Y-%m-%dT%H:%M:%S')"
 echo "materialize $START -> $END"
 feast materialize "$START" "$END"
-""".strip())
-    else:
-        raise ValueError(f"invalid mode: {mode}")
+""".strip()
+
+    raise ValueError(f"invalid mode: {mode}")
 
 def _kpo(task_id: str, mode: str) -> KubernetesPodOperator:
     repo_vols, repo_mounts = _repo_volumes()
