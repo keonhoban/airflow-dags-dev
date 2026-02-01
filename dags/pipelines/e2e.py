@@ -1,65 +1,133 @@
 # dags/pipelines/e2e.py
 from __future__ import annotations
 
+from airflow.exceptions import AirflowSkipException
 from airflow.utils.log.logging_mixin import LoggingMixin
 
-from ml_code.config import cfg, get_env
-from ml_code.train import train_model_and_log
-from ml_code.register import register_model_and_set_alias
-from ml_code.sensor import is_model_ready
-from ml_code.triton import (
-    snapshot_current,
-    materialize_shadow_from_run,
-    triton_load,
-    triton_ready,
-    triton_infer_smoke,
-    rollback_minimal,
-    commit_current,
-)
-from ml_code.fastapi import trigger_reload
-from utils.slack import notify_info, notify_success, notify_fail, notify_skip
+# ML 단계 코드 (이미 건호님이 갖고 있는 모듈)
+from ml_code.train_model import train_model, TrainSkippableError
+from ml_code.register_model import register_model
+from ml_code.sensor_model_ready import check_model_ready
+
+# Triton 배포 코드 (건호님 현재 구조 기준)
+from ml_code.triton_deploy import snapshot_current, materialize, triton_load, triton_ready, triton_infer_smoke, commit_current
+from utils.slack_alerts import notify_info, notify_success, notify_skip
+
+# (선택) Variable 읽기
+try:
+    from airflow.sdk import Variable
+except Exception:
+    from airflow.models import Variable
+
 
 log = LoggingMixin().log
 
 
+def _var(key: str, default=None):
+    try:
+        return Variable.get(key)
+    except Exception:
+        return default
+
+
+# -----------------------
+# Train
+# -----------------------
 def task_train_and_eval(ti, **_):
     """
-    - train + mlflow log + onnx artifact
-    - run_id, alias(고정) 등을 XCom으로 남김
+    ✅ 반드시 XCom: run_id, alias, accuracy 를 남긴다.
+    - 학습 자체가 불가능하면 SKIP 처리 (shadow/materialize도 자연스럽게 스킵)
     """
-    env = get_env()
-    alias = cfg("mlflow_alias", "A")  # dev/prod 변수로 제어
+    # 제출용 최소: 변수들 없으면 기본값으로 동작
+    C = float(_var("logreg_C", "1.0"))
+    max_iter = int(_var("logreg_max_iter", "200"))
+    alias = str(_var("mlflow_alias", "A"))
 
-    acc, run_id, n_features = train_model_and_log(ti=ti)
+    # DP에서 만든 feature_uri
+    feature_uri = ti.xcom_pull(key="fs_feature_uri", task_ids="store_features")
+    fs_version = ti.xcom_pull(key="fs_version", task_ids="store_features")
+    schema_hash = ti.xcom_pull(key="fs_schema_hash", task_ids="build_features")
 
-    ti.xcom_push(key="accuracy", value=float(acc))
+    try:
+        acc, run_id = train_model(
+            C=C,
+            max_iter=max_iter,
+            feature_uri=feature_uri,
+            fs_version=fs_version,
+            schema_hash=schema_hash,
+        )
+    except TrainSkippableError as e:
+        # ✅ 운영 기준: 학습 불가 조건은 "실패"가 아니라 "스킵" 처리
+        notify_skip("Train skipped (not enough data/classes)", reason=str(e))
+        raise AirflowSkipException(str(e))
+
+    # ✅ 여기서 핵심: downstream이 key="run_id"/"alias"로 pull하므로 반드시 push
     ti.xcom_push(key="run_id", value=run_id)
     ti.xcom_push(key="alias", value=alias)
-    ti.xcom_push(key="n_features", value=int(n_features))
+    ti.xcom_push(key="accuracy", value=float(acc))
 
-    notify_info("Train completed", env=env, run_id=run_id, acc=f"{acc:.4f}", alias=alias)
-    return acc
+    log.info("[E2E] train OK acc=%.4f run_id=%s alias=%s", acc, run_id, alias)
+    return float(acc)
 
 
+# -----------------------
+# Register (promotion path)
+# -----------------------
+def task_register_model(ti, **_):
+    """
+    promotion path: MLflow Model Registry 등록 + alias 세팅
+    """
+    run_id = ti.xcom_pull(task_ids="train_and_eval", key="run_id")
+    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias") or str(_var("mlflow_alias", "A"))
+    model_name = str(_var("model_name", "best_model"))
+
+    if not run_id:
+        raise AirflowSkipException("register_model skipped: run_id missing")
+
+    version = register_model(run_id=run_id, model_name=model_name, mlflow_alias=alias)
+    ti.xcom_push(key="version", value=str(version))
+    notify_info("MLflow register completed", model=model_name, alias=alias, version=str(version))
+    return str(version)
+
+
+def task_wait_model_ready(ti, **_):
+    model_name = str(_var("model_name", "best_model"))
+    version = ti.xcom_pull(task_ids="register_model", key="version")
+
+    if not version:
+        raise AirflowSkipException("model_ready skipped: version missing")
+
+    return check_model_ready(model_name=model_name, version=str(version))
+
+
+# -----------------------
+# Triton deploy
+# -----------------------
 def task_snapshot_current(ti, **_):
     snapshot_current(ti=ti)
 
 
 def task_triton_materialize_shadow(ti, **_):
     """
-    ✅ 항상 shadow deploy
-    - 레지스트리/alias 상관 없이 run_id로 모델 repo에 materialize
-    - 배포 검증의 기준점을 고정
+    ✅ shadow 배포는 run_id가 없으면 실패가 아니라 스킵이 맞다.
     """
+    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias") or str(_var("mlflow_alias", "A"))
     run_id = ti.xcom_pull(task_ids="train_and_eval", key="run_id")
-    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias")
-    env = get_env()
 
     if not run_id:
-        raise RuntimeError("run_id missing from XCom (train_and_eval)")
+        raise AirflowSkipException("shadow materialize skipped: run_id missing")
 
-    notify_info("Triton deploy (shadow)", env=env, alias=alias, run_id=run_id)
-    materialize_shadow_from_run(ti=ti, run_id=run_id, alias=alias)
+    notify_info("Triton materialize (shadow)", alias=alias, run_id=run_id)
+    materialize(ti=ti, alias=alias, run_id=run_id, shadow=True)
+
+
+def task_triton_materialize_promotion(ti, **_):
+    """
+    promotion 배포: alias 기준으로 Registry version 선택
+    """
+    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias") or str(_var("mlflow_alias", "A"))
+    notify_info("Triton materialize (promotion)", alias=alias)
+    materialize(ti=ti, alias=alias)
 
 
 def task_triton_load(ti, **_):
@@ -70,83 +138,13 @@ def task_triton_ready(ti, **_):
     triton_ready(ti=ti)
 
 
-def task_triton_infer_smoke(ti, **_):
+def task_triton_smoke(ti, **_):
     triton_infer_smoke(ti=ti)
-    env = get_env()
-    model = cfg("triton_model_name", required=True)
-    ver = ti.xcom_pull(task_ids="triton_materialize_shadow", key="deploy_version")
-    notify_success("Triton smoke OK", env=env, model=model, version=str(ver))
 
 
-def task_triton_rollback(ti, **_):
-    """
-    ✅ 배포 구간 실패시에만 호출되도록 DAG에서 연결
-    """
-    env = get_env()
-    try:
-        rollback_minimal(ti=ti)
-        notify_fail("Rollback executed", env=env)
-    except Exception as e:
-        notify_fail("Rollback failed", env=env, error=str(e))
-        raise
-
-
-def task_gate_promotion(ti, **_):
-    """
-    ShortCircuitOperator:
-      - True  -> promotion 진행
-      - False -> promotion 스킵 (하지만 shadow 배포 검증은 이미 완료)
-    """
-    env = get_env()
-    threshold = float(cfg("accuracy_threshold", "0.70"))
-    acc = float(ti.xcom_pull(task_ids="train_and_eval", key="accuracy") or 0.0)
-
-    if acc >= threshold:
-        notify_info("Promotion gate passed", env=env, acc=f"{acc:.4f}", threshold=str(threshold))
-        return True
-
-    notify_skip("Promotion skipped (below threshold)", env=env, acc=f"{acc:.4f}", threshold=str(threshold))
-    return False
-
-
-def task_register_if_promoted(ti, **_):
-    """
-    조건 통과 시:
-      - model version 생성
-      - alias 갱신
-      - version XCom push
-    """
-    env = get_env()
-    run_id = ti.xcom_pull(task_ids="train_and_eval", key="run_id")
-    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias")
-    model_name = cfg("model_name", required=True)
-
-    version = register_model_and_set_alias(run_id=run_id, model_name=model_name, alias=alias)
-    ti.xcom_push(key="version", value=int(version))
-    notify_success("MLflow registry updated", env=env, model=model_name, alias=alias, version=str(version))
-
-
-def task_wait_model_ready_if_promoted(ti, **_):
-    model_name = cfg("model_name", required=True)
-    version = ti.xcom_pull(task_ids="register_model", key="version")
-    if not version:
-        raise RuntimeError("version missing from XCom (register_model)")
-    return is_model_ready(model_name=model_name, version=str(version))
-
-
-def task_commit_current_if_promoted(ti, **_):
-    """
-    ✅ 여기서부터는 '운영 상태 기록'
-    - 실패해도 rollback 대상 아님(배포 검증은 이미 끝)
-    """
-    env = get_env()
+def task_commit_current(ti, **_):
     commit_current(ti=ti)
-    notify_success("current.json committed", env=env)
-
-
-def task_fastapi_reload_if_promoted(ti, **_):
-    env = get_env()
-    alias = ti.xcom_pull(task_ids="train_and_eval", key="alias") or "A"
-    trigger_reload(alias=alias)
-    notify_success("FastAPI reload completed", env=env, alias=alias)
+    alias = ti.xcom_pull(task_ids="materialize_repo", key="alias")
+    ver = ti.xcom_pull(task_ids="materialize_repo", key="deploy_version")
+    notify_success("Triton deploy committed", alias=str(alias), version=str(ver))
 
