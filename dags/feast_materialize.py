@@ -21,12 +21,16 @@ DEFAULT_ARGS = {
 FEAST_IMAGE = Variable.get("FEAST_IMAGE", default_var="hoizz/feast-server:0.40.1-s3fs")
 AWS_REGION = Variable.get("AWS_REGION", default_var="ap-northeast-2")
 
-# 공통: repo configmap 이름 (건호님 Helm에서 feast-repo 사용 중)
+# 공통: repo configmap 이름
 FEAST_REPO_CONFIGMAP = Variable.get("FEAST_REPO_CONFIGMAP", default_var="feast-repo")
 
 # 공통: AWS credentials secret 이름 (dev/prod가 다르면 변수로 분리)
 AWS_CRED_SECRET_DEV = Variable.get("FEAST_AWS_CRED_SECRET_DEV", default_var="aws-credentials-secret")
 AWS_CRED_SECRET_PROD = Variable.get("FEAST_AWS_CRED_SECRET_PROD", default_var="aws-credentials-secret")
+
+# ✅ 핵심: credentials 파일 안에 default가 없고 [rotator-dev]/[rotator-prod]만 있으므로 profile을 명시해야 함
+AWS_PROFILE_DEV = Variable.get("FEAST_AWS_PROFILE_DEV", default_var="rotator-dev")
+AWS_PROFILE_PROD = Variable.get("FEAST_AWS_PROFILE_PROD", default_var="rotator-prod")
 
 
 def _feast_task(
@@ -35,6 +39,7 @@ def _feast_task(
     task_id: str,
     namespace: str,
     aws_cred_secret_name: str,
+    aws_profile: str,
     mode: str,
 ) -> KubernetesPodOperator:
     """
@@ -54,7 +59,7 @@ def _feast_task(
         read_only=True,
     )
 
-    # AWS credentials secret 을 /root/.aws 로 마운트 (건호님 Helm과 동일)
+    # AWS credentials secret 을 /root/.aws 로 마운트
     vol_aws = k8s.V1Volume(
         name="aws-credentials",
         secret=k8s.V1SecretVolumeSource(secret_name=aws_cred_secret_name),
@@ -98,6 +103,7 @@ def _feast_task(
         arguments=[cmd],
         env_vars={
             "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
+            "AWS_PROFILE": aws_profile,  # ✅ 핵심
             "AWS_DEFAULT_REGION": AWS_REGION,
             "AWS_REGION": AWS_REGION,
         },
@@ -112,7 +118,7 @@ def _feast_task(
 with DAG(
     dag_id="feast_materialize",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
-    schedule="*/30 * * * *",  # 30분마다 (원하면 10분/1시간으로 조정)
+    schedule="*/30 * * * *",  # 30분마다
     catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["feature-store", "feast", "materialize"],
@@ -123,6 +129,7 @@ with DAG(
         task_id="feast_dev_incremental",
         namespace="feature-store-dev",
         aws_cred_secret_name=AWS_CRED_SECRET_DEV,
+        aws_profile=AWS_PROFILE_DEV,
         mode="incremental",
     )
 
@@ -132,11 +139,13 @@ with DAG(
         task_id="feast_prod_incremental",
         namespace="feature-store-prod",
         aws_cred_secret_name=AWS_CRED_SECRET_PROD,
+        aws_profile=AWS_PROFILE_PROD,
         mode="incremental",
     )
 
-    # 순서는 “동시에 돌려도 되지만”, 처음엔 dev → prod로 두는 게 운영 감각에 더 좋습니다.
+    # 처음엔 dev → prod 순서가 운영적으로 안전
     feast_dev_incremental >> feast_prod_incremental
+
 
 with DAG(
     dag_id="feast_full_refresh_manual",
@@ -151,6 +160,7 @@ with DAG(
         task_id="feast_dev_full_refresh",
         namespace="feature-store-dev",
         aws_cred_secret_name=AWS_CRED_SECRET_DEV,
+        aws_profile=AWS_PROFILE_DEV,
         mode="full",
     )
 
@@ -159,6 +169,7 @@ with DAG(
         task_id="feast_prod_full_refresh",
         namespace="feature-store-prod",
         aws_cred_secret_name=AWS_CRED_SECRET_PROD,
+        aws_profile=AWS_PROFILE_PROD,
         mode="full",
     )
 
