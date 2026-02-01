@@ -48,15 +48,26 @@ def _feast_task(
       - "full": apply + materialize(START, now)  # 복구용
     """
 
-    # ConfigMap(feast-repo) 를 /feast-repo 아래로 마운트
-    vol_repo = k8s.V1Volume(
-        name="feast-repo",
+    # ConfigMap source mount (숨김 디렉토리 구조 포함)
+    vol_repo_src = k8s.V1Volume(
+        name="feast-repo-src",
         config_map=k8s.V1ConfigMapVolumeSource(name=FEAST_REPO_CONFIGMAP),
     )
-    vm_repo = k8s.V1VolumeMount(
-        name="feast-repo",
-        mount_path="/feast-repo",
+    vm_repo_src = k8s.V1VolumeMount(
+        name="feast-repo-src",
+        mount_path="/feast-repo-src",
         read_only=True,
+    )
+
+    # Clean working dir (실행은 여기서)
+    vol_repo_work = k8s.V1Volume(
+        name="feast-repo-work",
+        empty_dir=k8s.V1EmptyDirVolumeSource(),
+    )
+    vm_repo_work = k8s.V1VolumeMount(
+        name="feast-repo-work",
+        mount_path="/feast-repo",
+        read_only=False,
     )
 
     # AWS credentials secret 을 /root/.aws 로 마운트
@@ -74,15 +85,18 @@ def _feast_task(
     if mode == "incremental":
         cmd = r"""
         set -eux
+        rm -rf /feast-repo/*
+        cp -R /feast-repo-src/* /feast-repo/
         cd /feast-repo
         feast apply
         feast materialize-incremental "$(date -u +"%Y-%m-%dT%H:%M:%S")"
         """
     elif mode == "full":
-        # 복구용: START는 넉넉히 과거로 (필요하면 Variable로 조정)
         start = Variable.get("FEAST_FULL_START", default_var="2026-01-01T00:00:00")
         cmd = rf"""
         set -eux
+        rm -rf /feast-repo/*
+        cp -R /feast-repo-src/* /feast-repo/
         cd /feast-repo
         feast apply
         START="{start}"
@@ -103,17 +117,16 @@ def _feast_task(
         arguments=[cmd],
         env_vars={
             "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
-            "AWS_PROFILE": aws_profile,  # ✅ 핵심
+            "AWS_PROFILE": aws_profile,
             "AWS_DEFAULT_REGION": AWS_REGION,
             "AWS_REGION": AWS_REGION,
         },
-        volumes=[vol_repo, vol_aws],
-        volume_mounts=[vm_repo, vm_aws],
+        volumes=[vol_repo_src, vol_repo_work, vol_aws],
+        volume_mounts=[vm_repo_src, vm_repo_work, vm_aws],
         get_logs=True,
         is_delete_operator_pod=True,
         startup_timeout_seconds=300,
     )
-
 
 with DAG(
     dag_id="feast_materialize",
