@@ -1,22 +1,28 @@
 # dags/mlops_lib/dp/s3.py
 from __future__ import annotations
 
-from urllib.parse import urlparse
+import io
+import json
 import boto3
+import pandas as pd
 
 
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    p = urlparse(uri)
-    if p.scheme != "s3":
-        raise ValueError(f"지원하지 않는 URI 스키마입니다: {uri}")
-    bucket = p.netloc
-    key = p.path.lstrip("/")
-    if not bucket or not key:
-        raise ValueError(f"잘못된 s3 uri 입니다: {uri}")
-    return bucket, key
-
-
-def get_s3_client():
-    # boto3 표준 credential chain 사용:
-    # 1) env, 2) shared credentials(~/.aws/credentials), 3) IAM role 등
+def s3_client():
     return boto3.client("s3")
+
+
+def put_parquet(bucket: str, key: str, df: pd.DataFrame):
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    buf.seek(0)
+    s3_client().put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+
+def put_json(bucket: str, key: str, payload: dict):
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    s3_client().put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+
+
+def s3_uri(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key}"
+
