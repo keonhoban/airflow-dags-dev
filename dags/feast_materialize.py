@@ -5,27 +5,22 @@ from datetime import datetime, timedelta
 import pendulum
 
 from airflow import DAG
-from airflow.models import Variable
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from kubernetes.client import models as k8s
 
 KST = pendulum.timezone("Asia/Seoul")
 
 # =========================
-# 최소 설정 (필요하면 Variable로 override)
+# 운영에서 바뀔만한 값만 "상수"로 고정
+# (변수/옵션 과다 제거: 면접/유지보수에 유리)
 # =========================
-FEAST_IMAGE = Variable.get("FEAST_IMAGE", default_var="hoizz/feast-server:0.40.1-s3fs")
-FEAST_REPO_CONFIGMAP = Variable.get("FEAST_REPO_CONFIGMAP", default_var="feast-repo")
+NAMESPACE = "feature-store-dev"
+FEAST_IMAGE = "hoizz/feast-server:0.40.1-s3fs"
 
-AWS_REGION = Variable.get("AWS_REGION", default_var="ap-northeast-2")
-AWS_PROFILE_DEV = Variable.get("FEAST_AWS_PROFILE_DEV", default_var="rotator-dev")
-AWS_CRED_SECRET_DEV = Variable.get("FEAST_AWS_CRED_SECRET_DEV", default_var="aws-credentials-secret")
-
-# full refresh 시작점(복구/초기화용)
-FEAST_FULL_START = Variable.get("FEAST_FULL_START", default_var="2026-01-01T00:00:00")
-
-# /bin/sh에서도 안전하게 동작하도록 pipefail 금지
-ULIMIT_NOFILE = int(Variable.get("FEAST_ULIMIT_NOFILE", default_var="8192"))
+FEAST_REPO_CONFIGMAP = "feast-repo"           # feature_store.yaml + repo.py 들어있는 CM
+AWS_CRED_SECRET = "aws-credentials-secret"    # /root/.aws/credentials
+AWS_REGION = "ap-northeast-2"
+AWS_PROFILE = "rotator-dev"
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -33,19 +28,19 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=3),
 }
 
-# =========================
-# K8s Volumes
-# =========================
-def _repo_volumes(configmap_name: str):
-    # ConfigMap은 atomic writer로 ..data 링크가 생길 수 있으니,
-    # emptyDir(work)로 복사해서 실행한다.
+
+def _feast_repo_volumes():
+    """
+    ConfigMap은 ..data(atomic writer) 링크 구조가 생길 수 있어
+    실행 디렉토리(emptyDir)에 복사 후 실행한다.
+    """
     vol_src = k8s.V1Volume(
         name="feast-repo-src",
-        config_map=k8s.V1ConfigMapVolumeSource(name=configmap_name),
+        config_map=k8s.V1ConfigMapVolumeSource(name=FEAST_REPO_CONFIGMAP),
     )
     vm_src = k8s.V1VolumeMount(
         name="feast-repo-src",
-        mount_path="/feast-repo-src",
+        mount_path="/repo-src",
         read_only=True,
     )
 
@@ -55,99 +50,86 @@ def _repo_volumes(configmap_name: str):
     )
     vm_work = k8s.V1VolumeMount(
         name="feast-repo-work",
-        mount_path="/feast-repo",
+        mount_path="/repo",
         read_only=False,
     )
-
     return [vol_src, vol_work], [vm_src, vm_work]
 
 
-def _aws_cred_volume(secret_name: str):
-    vol_aws = k8s.V1Volume(
+def _aws_cred_volume():
+    vol = k8s.V1Volume(
         name="aws-credentials",
-        secret=k8s.V1SecretVolumeSource(secret_name=secret_name),
+        secret=k8s.V1SecretVolumeSource(secret_name=AWS_CRED_SECRET),
     )
-    vm_aws = k8s.V1VolumeMount(
+    vm = k8s.V1VolumeMount(
         name="aws-credentials",
         mount_path="/root/.aws",
         read_only=True,
     )
-    return vol_aws, vm_aws
+    return vol, vm
 
 
-# =========================
-# Script builder (sh-safe)
-# =========================
-def _build_script(*, mode: str, full_start: str) -> str:
+def _script_incremental() -> str:
     """
-    목표:
-    - /bin/sh 환경에서 깨지지 않게 (pipefail 금지)
-    - bash 있으면 bash로 자동 재실행 (선택)
-    - ConfigMap atomic writer(..data) 오염 방지
+    /bin/sh 기준으로만 작성 (bash 의존 제거)
+    - repo 복사
+    - feast apply
+    - feast materialize-incremental now(UTC)
     """
-    lines: list[str] = [
-        # bash 있으면 bash -lc로 승급 (있을 때만)
-        'if command -v bash >/dev/null 2>&1; then exec bash -lc "$0"; fi',
-        "",
-        "set -eu",
-        "set -x",
-        f"ulimit -n {ULIMIT_NOFILE} || true",
-        "",
-        # workdir clean
-        "find /feast-repo -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
-        # copy configmap -> workdir (symlink 제거 위해 -aL)
-        "cp -aL /feast-repo-src/* /feast-repo/",
-        "",
-        # atomic writer 방어
-        "test ! -e /feast-repo/..data",
-        "test -f /feast-repo/feature_store.yaml",
-        "test -f /feast-repo/repo.py",
-        "ls -al /feast-repo",
-        "cd /feast-repo",
-        "",
-        "feast apply",
-        "",
-    ]
+    return r"""
+set -eu
 
-    if mode == "incremental":
-        lines += [
-            'feast materialize-incremental "$(date -u +\"%Y-%m-%dT%H:%M:%S\")"',
-        ]
-    elif mode == "full":
-        lines += [
-            f'START="{full_start}"',
-            'END="$(date -u +\"%Y-%m-%dT%H:%M:%S\")"',
-            'echo "materialize $START -> $END"',
-            'feast materialize "$START" "$END"',
-        ]
-    else:
-        raise ValueError(f"invalid mode: {mode}")
+# repo workdir 준비
+rm -rf /repo/* || true
+cp -a /repo-src/. /repo/
 
-    return "\n".join(lines) + "\n"
+cd /repo
+test -f feature_store.yaml
+test -f repo.py
+
+feast apply
+feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')"
+""".strip()
 
 
-def _feast_kpo(*, dag: DAG, task_id: str, mode: str) -> KubernetesPodOperator:
-    repo_vols, repo_mounts = _repo_volumes(FEAST_REPO_CONFIGMAP)
-    vol_aws, vm_aws = _aws_cred_volume(AWS_CRED_SECRET_DEV)
+def _script_full(start_iso: str) -> str:
+    return rf"""
+set -eu
 
-    script = _build_script(mode=mode, full_start=FEAST_FULL_START)
+rm -rf /repo/* || true
+cp -a /repo-src/. /repo/
+
+cd /repo
+test -f feature_store.yaml
+test -f repo.py
+
+feast apply
+START="{start_iso}"
+END="$(date -u +'%Y-%m-%dT%H:%M:%S')"
+echo "materialize $START -> $END"
+feast materialize "$START" "$END"
+""".strip()
+
+
+def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
+    repo_vols, repo_mounts = _feast_repo_volumes()
+    aws_vol, aws_mount = _aws_cred_volume()
 
     return KubernetesPodOperator(
-        dag=dag,
         task_id=task_id,
         name=task_id,
-        namespace="feature-store-dev",          # ✅ dev만
+        namespace=NAMESPACE,
         image=FEAST_IMAGE,
         cmds=["/bin/sh", "-c"],
         arguments=[script],
         env_vars={
             "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
-            "AWS_PROFILE": AWS_PROFILE_DEV,
+            "AWS_PROFILE": AWS_PROFILE,
             "AWS_DEFAULT_REGION": AWS_REGION,
             "AWS_REGION": AWS_REGION,
         },
-        volumes=[*repo_vols, vol_aws],
-        volume_mounts=[*repo_mounts, vm_aws],
+        volumes=[*repo_vols, aws_vol],
+        volume_mounts=[*repo_mounts, aws_mount],
         get_logs=True,
         is_delete_operator_pod=True,
         startup_timeout_seconds=300,
@@ -155,7 +137,7 @@ def _feast_kpo(*, dag: DAG, task_id: str, mode: str) -> KubernetesPodOperator:
 
 
 # =========================
-# DAG 1) 주기 incremental (dev only)
+# DAG 1) Incremental (30분 주기)
 # =========================
 with DAG(
     dag_id="feast_materialize_dev",
@@ -163,12 +145,14 @@ with DAG(
     schedule="*/30 * * * *",
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["feature-store", "feast", "dev", "materialize"],
+    tags=["feast", "feature-store", "dev"],
 ) as dag:
-    feast_incremental = _feast_kpo(dag=dag, task_id="feast_dev_incremental", mode="incremental")
+    _kpo("feast_materialize_incremental", _script_incremental())
+
 
 # =========================
-# DAG 2) 수동 full refresh (dev only)
+# DAG 2) Full refresh (수동 실행)
+# - 운영 복구/초기화용 (정상 운영에서는 거의 안 씀)
 # =========================
 with DAG(
     dag_id="feast_full_refresh_dev_manual",
@@ -176,7 +160,7 @@ with DAG(
     schedule=None,
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["feature-store", "feast", "dev", "recovery"],
+    tags=["feast", "feature-store", "dev", "recovery"],
 ) as dag_full:
-    feast_full = _feast_kpo(dag=dag_full, task_id="feast_dev_full_refresh", mode="full")
+    _kpo("feast_materialize_full", _script_full(start_iso="2026-01-01T00:00:00"))
 
