@@ -1,4 +1,4 @@
-# dags/feast_materialize.py
+# dags/feast_materialize_dev.py
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -10,15 +10,26 @@ from kubernetes.client import models as k8s
 
 KST = pendulum.timezone("Asia/Seoul")
 
+# =========================
+# ✅ 운영/면접/유지보수 기준: 바뀔만한 값만 상수로 고정
+# =========================
 NAMESPACE = "feature-store-dev"
-SERVICE_ACCOUNT = "airflow-dev-worker"  # ✅ RBAC RoleBinding 대상
 
 FEAST_IMAGE = "hoizz/feast-server:0.40.1-s3fs"
+
+# ConfigMap: feature_store.yaml + repo.py 포함
 FEAST_REPO_CONFIGMAP = "feast-repo"
 
+# AWS credentials secret: /root/.aws/credentials 로 마운트
 AWS_CRED_SECRET = "aws-credentials-secret"
-AWS_REGION = "ap-northeast-2"
 AWS_PROFILE = "rotator-dev"
+AWS_REGION = "ap-northeast-2"
+
+# Full refresh 시작점 (복구/초기화용)
+FULL_REFRESH_START_ISO = "2026-01-01T00:00:00"
+
+# 30분 주기 incremental
+SCHEDULE = "*/30 * * * *"
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -27,6 +38,11 @@ DEFAULT_ARGS = {
 }
 
 
+# =========================
+# K8s volumes
+# - ConfigMap은 ..data/..timestamp atomic writer 구조가 있어
+#   emptyDir에 복사 후 실행
+# =========================
 def _repo_volumes():
     vol_src = k8s.V1Volume(
         name="feast-repo-src",
@@ -47,6 +63,7 @@ def _repo_volumes():
         mount_path="/repo",
         read_only=False,
     )
+
     return [vol_src, vol_work], [vm_src, vm_work]
 
 
@@ -63,16 +80,22 @@ def _aws_cred_volume():
     return vol, vm
 
 
-def _script_incremental() -> str:
-    # ✅ 핵심: atomic writer(..data/..2026..) 오염 방지
+# =========================
+# sh-safe scripts
+# - dotfile(..data 등) 복사 방지
+# - symlink 실체화(-L)
+# =========================
+def _script_common_preamble() -> str:
     return r"""
 set -eu
+set -x
 
+# workdir clean
 rm -rf /repo/* || true
 
-# ConfigMap mount의 숨김 디렉토리(..data, ..2026_...)는 복사하지 않기:
-# 1) 와일드카드(*)로 dotfile 제외
-# 2) -L 로 symlink 실체화
+# ✅ 핵심: ConfigMap mount의 숨김 디렉토리(..data, ..2026_...)는 복사하지 않기
+# - * 로 dotfile 제외
+# - -L 로 symlink 실체화
 cp -aL /repo-src/* /repo/
 
 # 혹시 남아있으면 제거(안전망)
@@ -81,23 +104,24 @@ find /repo -maxdepth 1 -name '..*' -exec rm -rf {} + || true
 cd /repo
 test -f feature_store.yaml
 test -f repo.py
+""".strip()
+
+
+def _script_incremental() -> str:
+    return (
+        _script_common_preamble()
+        + r"""
 
 feast apply
 feast materialize-incremental "$(date -u +'%Y-%m-%dT%H:%M:%S')"
 """.strip()
+    )
 
 
 def _script_full(start_iso: str) -> str:
-    return rf"""
-set -eu
-
-rm -rf /repo/* || true
-cp -aL /repo-src/* /repo/
-find /repo -maxdepth 1 -name '..*' -exec rm -rf {{}} + || true
-
-cd /repo
-test -f feature_store.yaml
-test -f repo.py
+    return (
+        _script_common_preamble()
+        + rf"""
 
 feast apply
 START="{start_iso}"
@@ -105,6 +129,7 @@ END="$(date -u +'%Y-%m-%dT%H:%M:%S')"
 echo "materialize $START -> $END"
 feast materialize "$START" "$END"
 """.strip()
+    )
 
 
 def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
@@ -115,7 +140,6 @@ def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
         task_id=task_id,
         name=task_id,
         namespace=NAMESPACE,
-        service_account_name=SERVICE_ACCOUNT,  # ✅ RBAC 일치
         image=FEAST_IMAGE,
         cmds=["/bin/sh", "-c"],
         arguments=[script],
@@ -133,10 +157,13 @@ def _kpo(task_id: str, script: str) -> KubernetesPodOperator:
     )
 
 
+# =========================
+# DAG 1) Incremental (주기)
+# =========================
 with DAG(
     dag_id="feast_materialize_dev",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
-    schedule="*/30 * * * *",
+    schedule=SCHEDULE,
     catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["feast", "feature-store", "dev"],
@@ -144,6 +171,9 @@ with DAG(
     _kpo("feast_materialize_incremental", _script_incremental())
 
 
+# =========================
+# DAG 2) Full refresh (수동)
+# =========================
 with DAG(
     dag_id="feast_full_refresh_dev_manual",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
@@ -152,5 +182,5 @@ with DAG(
     default_args=DEFAULT_ARGS,
     tags=["feast", "feature-store", "dev", "recovery"],
 ) as dag_full:
-    _kpo("feast_materialize_full", _script_full(start_iso="2026-01-01T00:00:00"))
+    _kpo("feast_materialize_full", _script_full(start_iso=FULL_REFRESH_START_ISO))
 
