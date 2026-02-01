@@ -1,17 +1,16 @@
-# dags/mlops_lib/dp/store.py
 from __future__ import annotations
 
 import json
 import io
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
 from airflow.utils.log.logging_mixin import LoggingMixin
 from jinja2 import Template
 
-import pandas as pd
-
 from .s3 import get_s3_client, parse_s3_uri
 
-logger = LoggingMixin().log
+log = LoggingMixin().log
 KST = timezone(timedelta(hours=9))
 
 
@@ -30,11 +29,6 @@ def _read_local_text(path: str) -> str:
 
 
 def store_features(feature_base: str, pipeline_name: str, feature_set: str, metadata_tpl_path: str, ti) -> None:
-    """
-    ✅ 제출/운영 기준 핵심:
-    - versioned + latest를 동시에 유지
-    - 재현성: feature_uri는 versioned parquet을 기준으로 남김
-    """
     s3 = get_s3_client()
 
     schema = ti.xcom_pull(key="fs_schema", task_ids="build_features")
@@ -46,14 +40,13 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     )
 
     if not features_csv:
-        raise ValueError("features_csv missing from XCom (build_features)")
+        raise ValueError("[FS] features_csv missing")
 
     exec_date = getattr(ti, "execution_date", None)
     ver = _version_id(exec_date)
 
     bkt, base_prefix = parse_s3_uri(feature_base)
     base_prefix = base_prefix.rstrip("/") + f"/{feature_set}/"
-
     ver_prefix = base_prefix + f"{ver}/"
     latest_prefix = base_prefix + "latest/"
 
@@ -74,7 +67,6 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     meta_bytes = meta_str.encode("utf-8")
     feat_csv_bytes = features_csv.encode("utf-8")
 
-    # CSV -> Parquet (event_timestamp는 UTC datetime이어야 함)
     df = pd.read_csv(io.StringIO(features_csv))
     if "event_timestamp" not in df.columns:
         df["event_timestamp"] = pd.Timestamp.now(tz="Asia/Seoul").tz_convert("UTC")
@@ -99,5 +91,5 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     ti.xcom_push(key="fs_latest_prefix", value=f"s3://{bkt}/{latest_prefix}")
     ti.xcom_push(key="fs_feature_uri", value=feature_uri)
 
-    logger.info("[FS] store OK version=%s rows=%s feature_uri=%s", ver, rows, feature_uri)
+    log.info("[FS] store_features OK version=%s rows=%s", ver, rows)
 

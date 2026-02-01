@@ -1,37 +1,30 @@
-# dags/mlops_lib/dp/build.py
 from __future__ import annotations
 
 import io
 import csv
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from .s3 import get_s3_client, parse_s3_uri
 from .feature_schema import load_schema
 
-logger = LoggingMixin().log
+log = LoggingMixin().log
 KST = timezone(timedelta(hours=9))
 
 
 def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_path: str, ti) -> None:
     schema, schema_hash = load_schema(schema_path, expected_feature_set=feature_set)
     cols = [c["name"] for c in schema["columns"]]
-
-    # ✅ Feast/Serving 등 확장 대비: timestamp 컬럼 없으면 강제로 추가
     if "event_timestamp" not in cols:
         cols.append("event_timestamp")
 
     s3 = get_s3_client()
     bucket, key = parse_s3_uri(raw_path)
-
-    logger.info("[DP] get_object bucket=%s key=%s", bucket, key)
     obj = s3.get_object(Bucket=bucket, Key=key)
     text = obj["Body"].read().decode("utf-8")
 
-    reader = csv.DictReader(io.StringIO(text))
-    rows = list(reader)
-
+    rows = list(csv.DictReader(io.StringIO(text)))
     by_user: dict[int, dict] = {}
     now = datetime.now(KST)
 
@@ -72,7 +65,7 @@ def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_p
             rec["sess_cnt"] += 1
 
         ts = _parse_ts(r.get("event_ts") or r.get("timestamp") or r.get("ts"))
-        if ts and ((rec["max_ts"] is None) or (ts > rec["max_ts"])):
+        if ts and (rec["max_ts"] is None or ts > rec["max_ts"]):
             rec["max_ts"] = ts
 
     feature_rows = []
@@ -98,5 +91,5 @@ def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_p
     ti.xcom_push(key="fs_feature_rows", value=len(feature_rows))
     ti.xcom_push(key="dp_raw_path", value=raw_path)
 
-    logger.info("[FS] build OK rows=%d schema_hash=%s", len(feature_rows), schema_hash)
+    log.info("[FS] build_features OK set=%s rows=%d schema_hash=%s", feature_set, len(feature_rows), schema_hash)
 

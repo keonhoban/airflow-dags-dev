@@ -1,4 +1,3 @@
-# dags/mlops_lib/dp/feature_schema.py
 from __future__ import annotations
 
 import json
@@ -21,11 +20,11 @@ def sha256_hex(b: bytes) -> str:
 def load_schema(schema_path: str, expected_feature_set: str) -> tuple[dict, str]:
     schema = read_local_json(schema_path)
     if schema.get("feature_set") != expected_feature_set:
-        raise ValueError(f"schema feature_set mismatch: {schema.get('feature_set')} != {expected_feature_set}")
+        raise ValueError(f"[FS] schema feature_set mismatch: {schema.get('feature_set')} != {expected_feature_set}")
 
     cols = [c["name"] for c in schema.get("columns", [])]
     if "user_id" not in cols:
-        raise ValueError("schema must include user_id")
+        raise ValueError("[FS] schema missing user_id")
 
     schema_hash = sha256_hex(json_canonical_bytes(schema))
     return schema, schema_hash
