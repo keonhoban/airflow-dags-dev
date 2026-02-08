@@ -15,7 +15,7 @@ NAMESPACE = "feature-store-dev"
 
 FEAST_IMAGE = "hoizz/feast-server:0.40.1-s3fs"
 FEAST_REPO_CONFIGMAP = "feast-repo"           # ✅ 반드시 존재해야 함
-AWS_CRED_SECRET = "aws-credentials-secret"    # ✅ 기존 secretName과 일치
+AWS_CRED_SECRET = "aws-credentials"   
 
 AWS_REGION = "ap-northeast-2"
 AWS_PROFILE = "rotator-dev"
