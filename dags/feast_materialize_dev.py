@@ -65,6 +65,7 @@ def _aws_cred_volume():
 def _script(mode: str) -> str:
     base = r"""
 set -eu
+ulimit -n 65536 || true
 
 rm -rf /repo/* || true
 
