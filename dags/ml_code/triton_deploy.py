@@ -299,3 +299,42 @@ def rollback_minimal(ti, **_):
     except Exception as e:
         log.warning("[ROLLBACK] reload failed: %s", e)
 
+def rollback_manual(model: str | None = None, deploy_version: int | None = None):
+    """
+    Manual rollback (ops/interview consistent):
+    - If deploy_version is set, force-write current.json active_version to that value
+      and reload Triton repository.
+    - If deploy_version is empty, keep current.json and just reload.
+    """
+    model = model or cfg("triton_model_name", required=True)
+    repo = cfg("triton_repo_base", "/models")
+    model_dir = os.path.join(repo, model)
+    os.makedirs(model_dir, exist_ok=True)
+
+    path = os.path.join(model_dir, "current.json")
+
+    cur = None
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                cur = json.load(f)
+        except Exception as e:
+            log.warning("[rollback_manual] read current.json failed: %s", e)
+
+    if deploy_version is not None:
+        cur = cur or {}
+        cur["active_version"] = int(deploy_version)
+        cur["updated_at_utc"] = utc_ts()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cur, f, indent=2)
+        os.replace(tmp, path)
+        log.warning("[ROLLBACK_MANUAL] forced active_version=%s path=%s", deploy_version, path)
+    else:
+        log.warning("[ROLLBACK_MANUAL] no deploy_version -> reload only path=%s", path)
+
+    triton = build_triton_http_url()
+    r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"[ROLLBACK_MANUAL] reload failed: {r.status_code} {r.text}")
+    log.warning("[ROLLBACK_MANUAL] reload OK status=%s", r.status_code)
