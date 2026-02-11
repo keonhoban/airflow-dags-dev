@@ -133,7 +133,9 @@ def materialize(
     shadow: run_id -> repo/<model>/<timestamp>/  (registry 없이도 검증 가능)
     """
     base_model = cfg("triton_model_name", required=True)
-    model = cfg("triton_model_name_shadow", base_model) if shadow else base_model
+
+    default_shadow = f"{base_model}_shadow"
+    model = cfg("triton_model_name_shadow", default_shadow) if shadow else base_model
 
     repo = cfg("triton_repo_base", "/models")
     onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
@@ -250,14 +252,19 @@ def triton_infer_smoke(ti, **_):
 
     log.info("[smoke] OK model=%s resp=%s", model, r.text[:300])
 
-
 def commit_current(ti, **_):
     model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir")
+    deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key="deploy_mode")
+
+    if deploy_mode == "shadow":
+        log.warning("[commit] skip current.json write for shadow deploy model_dir=%s", model_dir)
+        return
+
     payload = {
         "active_version": ti.xcom_pull(task_ids="materialize_repo", key="deploy_version"),
         "run_id": ti.xcom_pull(task_ids="materialize_repo", key="run_id"),
         "alias": ti.xcom_pull(task_ids="materialize_repo", key="alias"),
-        "deploy_mode": ti.xcom_pull(task_ids="materialize_repo", key="deploy_mode"),
+        "deploy_mode": deploy_mode,
         "updated_at_utc": utc_ts(),
     }
     path = os.path.join(model_dir, "current.json")
