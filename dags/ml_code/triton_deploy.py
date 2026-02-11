@@ -1,10 +1,7 @@
 # dags/ml_code/triton_deploy.py
 from __future__ import annotations
 
-import os
-import json
-import shutil
-import re
+import os, json, shutil, re
 from datetime import datetime, timezone
 
 import requests
@@ -18,19 +15,12 @@ log = LoggingMixin().log
 
 
 # -----------------------
-# Config
+# Config helpers
 # -----------------------
 def cfg(key: str, default=None, *, required: bool = False):
-    """
-    Priority:
-    1) Env var
-    2) Airflow Variable
-    3) default
-    """
     v = os.getenv(key)
     if v is not None and str(v).strip() != "":
         return v
-
     try:
         if default is None:
             v = Variable.get(key)
@@ -40,32 +30,21 @@ def cfg(key: str, default=None, *, required: bool = False):
             return v
     except Exception:
         pass
-
     if required:
         raise RuntimeError(f"[Config] missing required key: {key}")
     return default
 
 
-def utc_ts() -> str:
+def utc_ts():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 
 def build_triton_http_url() -> str:
-    """
-    권장: Helm values로 TRITON_HTTP_URL 또는 TRITON_NAMESPACE를 명시하세요.
-    """
     full = cfg("TRITON_HTTP_URL", None)
     if full:
         return full
-
     svc = cfg("TRITON_SERVICE", "triton")
-
-    # env/variable로 제어 가능
-    ns = cfg("TRITON_NAMESPACE", None) or cfg("triton_namespace", None)
-    if not ns:
-        env = (cfg("triton_env", "dev") or "dev").strip()
-        ns = f"triton-{env}"
-
+    ns = cfg("TRITON_NAMESPACE", "triton-dev")
     port = cfg("TRITON_HTTP_PORT", "8000")
     return f"http://{svc}.{ns}.svc.cluster.local:{port}"
 
@@ -73,36 +52,34 @@ def build_triton_http_url() -> str:
 # -----------------------
 # MLflow helpers
 # -----------------------
-def get_run_params(run_id: str) -> dict:
+def _mlflow_client() -> MlflowClient:
     uri = cfg("MLFLOW_TRACKING_URI", required=True)
     mlflow.set_tracking_uri(uri)
-    c = MlflowClient(tracking_uri=uri)
+    return MlflowClient(tracking_uri=uri)
+
+
+def get_run_params(run_id: str) -> dict:
+    c = _mlflow_client()
     run = c.get_run(run_id)
     return dict(run.data.params or {})
 
 
 def select_by_alias(model_name: str, alias: str):
-    """
-    model_name(등록 모델) + alias -> (version, run_id)
-    """
-    uri = cfg("MLFLOW_TRACKING_URI", required=True)
-    mlflow.set_tracking_uri(uri)
-    c = MlflowClient(tracking_uri=uri)
+    c = _mlflow_client()
     mv = c.get_model_version_by_alias(model_name, alias)
-    return int(mv.version), mv.run_id
+    return int(mv.version), str(mv.run_id)
+
+
+def run_id_by_version(model_name: str, version: int) -> str:
+    c = _mlflow_client()
+    mv = c.get_model_version(model_name, str(int(version)))
+    return str(mv.run_id)
 
 
 # -----------------------
-# config.pbtxt builder
+# Triton config.pbtxt builder
 # -----------------------
-def build_config_pbtxt(
-    model: str,
-    in_name: str,
-    out_prob: str,
-    out_label: str,
-    n_features: int,
-    n_classes: int,
-) -> str:
+def build_config_pbtxt(model: str, in_name: str, out_prob: str, out_label: str, n_features: int, n_classes: int) -> str:
     return f'''name: "{model}"
 platform: "onnxruntime_onnx"
 max_batch_size: 0
@@ -130,6 +107,10 @@ output [
 '''
 
 
+def _parse_output_names(raw: str):
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
 def _atomic_write(path: str, content: str):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -137,38 +118,12 @@ def _atomic_write(path: str, content: str):
     os.replace(tmp, path)
 
 
-def _read_json(path: str):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning("[json] read failed: %s path=%s", e, path)
-        return None
-
-
-def _write_json(path: str, payload: dict):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, path)
-
-
-def _parse_output_names(raw: str):
-    return [x.strip() for x in (raw or "").split(",") if x.strip()]
-
-
 # -----------------------
-# ✅ version_policy specific (핵심 스위치)
+# version_policy (핵심 스위치)
 # -----------------------
 _VERSION_POLICY_RE = re.compile(r"\nversion_policy\s*\{.*?\}\s*\n", re.DOTALL)
 
-
 def _set_version_policy_specific(config_text: str, version: int) -> str:
-    """
-    config.pbtxt에 version_policy specific을 강제 주입/치환
-    """
     vp = f"""
 version_policy {{
   specific {{
@@ -180,11 +135,7 @@ version_policy {{
         return _VERSION_POLICY_RE.sub(vp + "\n", config_text)
     return config_text.rstrip() + vp + "\n"
 
-
 def write_or_update_config_policy(model_dir: str, *, version: int):
-    """
-    기존 config.pbtxt 유지 + version_policy만 specific으로 갱신
-    """
     config_path = os.path.join(model_dir, "config.pbtxt")
     if not os.path.exists(config_path):
         raise RuntimeError(f"[config] missing config.pbtxt at {config_path}")
@@ -198,7 +149,7 @@ def write_or_update_config_policy(model_dir: str, *, version: int):
 
 
 # -----------------------
-# Airflow tasks
+# Tasks
 # -----------------------
 def snapshot_current(ti, **_):
     model = cfg("triton_model_name", required=True)
@@ -206,50 +157,50 @@ def snapshot_current(ti, **_):
     model_dir = os.path.join(repo, model)
     path = os.path.join(model_dir, "current.json")
 
-    prev = _read_json(path)
+    prev = None
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                prev = json.load(f)
+        except Exception as e:
+            log.warning("[snapshot] read current.json failed: %s", e)
+
     ti.xcom_push(key="prev_current", value=prev)
     log.info("[snapshot] model=%s prev=%s", model, prev)
 
 
-def materialize(
-    ti,
-    alias: str = "A",
-    *,
-    run_id: str | None = None,
-    shadow: bool = False,
-    **_,
-):
+def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool = False, **_):
     """
-    promotion: alias -> (version, run_id) -> repo/<model>/<version>/
-    shadow   : run_id only -> repo/<shadow_model>/<timestamp>/
-      ✅ shadow는 main model 디렉토리를 오염시키지 않음
+    - promotion: alias -> version/run_id -> /models/<model>/<version>/model.onnx
+    - shadow:    run_id -> /models/<model_shadow>/<timestamp>/model.onnx
     """
     base_model = cfg("triton_model_name", required=True)
-    shadow_model = cfg("triton_model_name_shadow", f"{base_model}_shadow")
-
-    model = shadow_model if shadow else base_model
     repo = cfg("triton_repo_base", "/models")
     onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
+
+    # model name 선택
+    default_shadow = f"{base_model}_shadow"
+    model = cfg("triton_model_name_shadow", default_shadow) if shadow else base_model
 
     if run_id:
         chosen_run_id = run_id
         deploy_version = int(datetime.now().strftime("%Y%m%d%H%M%S"))
         mode = "shadow"
-        alias = (alias or "").strip() or "A"
     else:
         alias = (alias or "").strip() or cfg("mlflow_alias", "A")
-        deploy_version, chosen_run_id = select_by_alias(base_model, alias)
+        deploy_version, chosen_run_id = select_by_alias(model, alias)
         mode = "promote"
 
+    # artifact download
     uri = cfg("MLFLOW_TRACKING_URI", required=True)
     mlflow.set_tracking_uri(uri)
     local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{chosen_run_id}/{onnx_rel}")
 
+    # params -> shape/meta
     params = get_run_params(chosen_run_id)
     n_features = int(params.get("n_features", "0") or "0")
     n_classes = int(params.get("n_classes", "0") or "0")
     in_name = params.get("onnx_input_name", "input")
-
     outs = _parse_output_names(params.get("onnx_output_names", ""))
 
     out_label = "label"
@@ -273,26 +224,23 @@ def materialize(
     ver_dir = os.path.join(model_dir, str(deploy_version))
     os.makedirs(ver_dir, exist_ok=True)
 
+    # copy model.onnx (atomic)
     dst = os.path.join(ver_dir, "model.onnx")
     tmp = dst + ".tmp"
     shutil.copyfile(local, tmp)
     os.replace(tmp, dst)
 
+    # config.pbtxt write + (나중에 policy는 commit/rollback에서 설정)
     os.makedirs(model_dir, exist_ok=True)
-    config_path = os.path.join(model_dir, "config.pbtxt")
-    _atomic_write(config_path, build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes))
+    _atomic_write(os.path.join(model_dir, "config.pbtxt"), build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes))
 
-    # ✅ materialize 시점부터 "이번 버전만 로드"하도록 specific 정책 고정
-    write_or_update_config_policy(model_dir, version=int(deploy_version))
-
+    # xcom
     ti.xcom_push(key="model", value=model)
     ti.xcom_push(key="model_dir", value=model_dir)
     ti.xcom_push(key="deploy_version", value=int(deploy_version))
     ti.xcom_push(key="run_id", value=chosen_run_id)
     ti.xcom_push(key="alias", value=alias)
     ti.xcom_push(key="deploy_mode", value=mode)
-
-    # smoke 용
     ti.xcom_push(key="n_features", value=n_features)
     ti.xcom_push(key="n_classes", value=n_classes)
     ti.xcom_push(key="onnx_input_name", value=in_name)
@@ -328,22 +276,10 @@ def triton_infer_smoke(ti, **_):
         raise RuntimeError("[smoke] missing n_features")
 
     payload = {
-        "inputs": [
-            {
-                "name": in_name,
-                "shape": [1, n_features],
-                "datatype": "FP32",
-                "data": [[0.0 for _ in range(n_features)]],
-            }
-        ]
+        "inputs": [{"name": in_name, "shape": [1, n_features], "datatype": "FP32", "data": [[0.0 for _ in range(n_features)]]}]
     }
 
-    r = requests.post(
-        f"{triton}/v2/models/{model}/infer",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=10,
-    )
+    r = requests.post(f"{triton}/v2/models/{model}/infer", headers={"Content-Type": "application/json"}, json=payload, timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"[infer] failed: {r.status_code} {r.text}")
 
@@ -352,67 +288,62 @@ def triton_infer_smoke(ti, **_):
 
 def commit_current(ti, **_):
     """
-    ✅ current.json 기록 + config.pbtxt version_policy specific 갱신
-    (current.json은 운영/사람용, config.pbtxt가 Triton 동작의 진짜 스위치)
+    ✅ promotion 성공 시:
+    - current.json 기록
+    - config.pbtxt version_policy specific = deploy_version (SSOT)
     """
     model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir")
-    deploy_version = int(ti.xcom_pull(task_ids="materialize_repo", key="deploy_version"))
     deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key="deploy_mode")
 
-    # shadow 배포는 current.json 건드리지 않음
     if deploy_mode == "shadow":
-        log.warning("[commit] skip current.json write for shadow deploy model_dir=%s", model_dir)
+        log.warning("[commit] skip current.json/config policy for shadow deploy model_dir=%s", model_dir)
         return
+
+    deploy_version = int(ti.xcom_pull(task_ids="materialize_repo", key="deploy_version"))
+    run_id = ti.xcom_pull(task_ids="materialize_repo", key="run_id")
+    alias = ti.xcom_pull(task_ids="materialize_repo", key="alias")
 
     payload = {
         "active_version": deploy_version,
-        "run_id": ti.xcom_pull(task_ids="materialize_repo", key="run_id"),
-        "alias": ti.xcom_pull(task_ids="materialize_repo", key="alias"),
+        "run_id": run_id,
+        "alias": alias,
         "deploy_mode": deploy_mode,
         "updated_at_utc": utc_ts(),
     }
 
     path = os.path.join(model_dir, "current.json")
-    _write_json(path, payload)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
 
-    # ✅ Triton에 "이번 버전만 로드" 강제 (핵심)
     write_or_update_config_policy(model_dir, version=deploy_version)
-
-    log.info("[commit] OK path=%s version=%s", path, deploy_version)
+    log.info("[commit] OK version=%s path=%s", deploy_version, path)
 
 
 def rollback_minimal(ti, **_):
     """
-    실패시 자동 롤백(최소):
-    - prev current.json 복구
-    - 실패 버전 디렉토리 격리
-    - unload/load
-    - prev active_version이 있으면 그 버전으로 specific 정책 복구(핵심)
+    실패 시 최소 롤백:
+    - current.json 복구 (snapshot)
+    - 실패 버전 디렉터리 move
+    - Triton reload 시도
     """
     model = ti.xcom_pull(task_ids="materialize_repo", key="model") or cfg("triton_model_name", required=True)
-    repo = cfg("triton_repo_base", "/models")
-    model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir") or os.path.join(repo, model)
+    model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir") or os.path.join(cfg("triton_repo_base", "/models"), model)
     deploy_v = ti.xcom_pull(task_ids="materialize_repo", key="deploy_version")
     prev = ti.xcom_pull(task_ids="snapshot_current", key="prev_current")
 
     triton = build_triton_http_url()
     log.warning("[ROLLBACK] start model=%s deploy_version=%s prev=%s", model, deploy_v, prev)
 
-    # restore current.json
     if prev is not None:
         path = os.path.join(model_dir, "current.json")
-        _write_json(path, prev)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(prev, f, indent=2)
+        os.replace(tmp, path)
         log.warning("[ROLLBACK] restored current.json")
 
-        # ✅ prev active_version으로 specific 정책 복구
-        try:
-            av = prev.get("active_version")
-            if av is not None:
-                write_or_update_config_policy(model_dir, version=int(av))
-        except Exception as e:
-            log.warning("[ROLLBACK] policy restore failed: %s", e)
-
-    # quarantine failed dir
     if deploy_v is not None:
         ver_dir = os.path.join(model_dir, str(deploy_v))
         if os.path.isdir(ver_dir):
@@ -420,48 +351,83 @@ def rollback_minimal(ti, **_):
             os.rename(ver_dir, failed_dir)
             log.warning("[ROLLBACK] moved failed dir: %s -> %s", ver_dir, failed_dir)
 
-    # unload/load
+    # best-effort reload
     try:
-        requests.post(f"{triton}/v2/repository/models/{model}/unload", timeout=10)
         r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
         log.warning("[ROLLBACK] reload status=%s body=%s", r.status_code, r.text[:200])
     except Exception as e:
         log.warning("[ROLLBACK] reload failed: %s", e)
 
+def rebuild_config_for_version(model: str, version: int) -> str:
+    run_id = run_id_by_version(model, int(version))
+    params = get_run_params(run_id)
+
+    n_features = int(params.get("n_features", "0") or "0")
+    n_classes = int(params.get("n_classes", "0") or "0")
+    in_name = params.get("onnx_input_name", "input")
+
+    outs = _parse_output_names(params.get("onnx_output_names", ""))
+    out_label = "label"
+    out_prob = "probabilities"
+    for cand in outs:
+        if "label" in cand.lower():
+            out_label = cand
+        if "prob" in cand.lower():
+            out_prob = cand
+
+    if n_features <= 0 or n_classes <= 0:
+        raise RuntimeError(f"[config] invalid n_features/n_classes: {n_features}/{n_classes}")
+
+    base = build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes)
+    clean = _set_version_policy_specific(base, int(version))
+    return clean
 
 def rollback_manual(model: str | None = None, deploy_version: int | None = None):
-    """
-    Manual rollback (ops/interview consistent):
-    - deploy_version 주면:
-        1) current.json active_version 갱신
-        2) config.pbtxt version_policy specific = deploy_version
-        3) unload/load
-    - deploy_version 없으면:
-        1) current.json 유지
-        2) unload/load
-    """
     model = model or cfg("triton_model_name", required=True)
     repo = cfg("triton_repo_base", "/models")
     model_dir = os.path.join(repo, model)
     os.makedirs(model_dir, exist_ok=True)
 
     path = os.path.join(model_dir, "current.json")
-    cur = _read_json(path) or {}
-
-    if deploy_version is not None:
-        cur["active_version"] = int(deploy_version)
-        cur["updated_at_utc"] = utc_ts()
-        _write_json(path, cur)
-        log.warning("[ROLLBACK_MANUAL] forced active_version=%s path=%s", deploy_version, path)
-
-        # ✅ Triton 동작을 실제로 바꾸는 핵심
-        write_or_update_config_policy(model_dir, version=int(deploy_version))
-    else:
-        log.warning("[ROLLBACK_MANUAL] no deploy_version -> reload only path=%s", path)
+    cur = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                cur = json.load(f) or {}
+        except Exception as e:
+            log.warning("[rollback_manual] read current.json failed: %s", e)
 
     triton = build_triton_http_url()
-    # ✅ unload/load가 가장 확실
-    requests.post(f"{triton}/v2/repository/models/{model}/unload", timeout=10)
+
+    if deploy_version is not None:
+        dv = int(deploy_version)
+        cur["active_version"] = dv
+        cur["run_id"] = run_id_by_version(model, dv)
+        cur["deploy_mode"] = "rollback_manual"
+        cur["updated_at_utc"] = utc_ts()
+
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cur, f, indent=2)
+        os.replace(tmp, path)
+
+        # ✅ config는 “부분 수정” 금지 → 항상 재생성
+        cfg_text = rebuild_config_for_version(model, dv)
+        _atomic_write(os.path.join(model_dir, "config.pbtxt"), cfg_text)
+
+        log.warning("[ROLLBACK_MANUAL] forced dv=%s run_id=%s", dv, cur["run_id"])
+    else:
+        log.warning("[ROLLBACK_MANUAL] no deploy_version -> reload only")
+
+    # ✅ explicit 모드 정석: unload → load
+    try:
+        requests.post(f"{triton}/v2/repository/models/{model}/unload", timeout=10)
+    except Exception:
+        pass
+
+    import time
+    time.sleep(0.5)
+
     r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"[ROLLBACK_MANUAL] reload failed: {r.status_code} {r.text}")

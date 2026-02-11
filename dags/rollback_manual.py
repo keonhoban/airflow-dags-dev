@@ -8,7 +8,7 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
-from ml_code.triton_deploy import rollback_manual
+from ml_code.triton_deploy import rollback_manual as triton_rollback_manual
 from ml_code.trigger_reload import trigger_reload
 from utils.slack_alerts import alert_slack
 
@@ -22,29 +22,25 @@ def _get_var(key: str, default: str = "") -> str:
         return default
 
 
-def _as_bool(raw: str) -> bool:
-    return (raw or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _get_bool(key: str, default: str = "false") -> bool:
+    v = (_get_var(key, default) or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
 
 def _run():
-    """
-    Variables:
-      - rollback_model_name (optional)
-      - rollback_deploy_version (optional int)
-      - rollback_fastapi_reload (optional bool, default false)
-      - rollback_fastapi_variant (optional, default A)
-    """
+    # Airflow Variables (UI에서 즉시 제어 가능)
     model = _get_var("rollback_model_name", "")
     dv_raw = _get_var("rollback_deploy_version", "")
     deploy_version = int(dv_raw) if dv_raw else None
 
-    # ✅ Triton rollback (current.json + version_policy + unload/load)
-    rollback_manual(model=model or None, deploy_version=deploy_version)
+    # 1) Triton rollback (SSOT)
+    triton_rollback_manual(model=model or None, deploy_version=deploy_version)
 
-    # ✅ 기본 OFF (원하면 Variable로 켜기)
-    if _as_bool(_get_var("rollback_fastapi_reload", "false")):
-        variant = (_get_var("rollback_fastapi_variant", "A") or "A").strip()
-        trigger_reload(variant)
+    # 2) FastAPI 동기화 (옵션 토글)
+    # - rollback_fastapi_reload=false면 "Triton만 SSOT"로 끝 (서비스 영향 최소)
+    if _get_bool("rollback_fastapi_reload", "false"):
+        variant = _get_var("rollback_fastapi_variant", "A") or "A"
+        trigger_reload(variant, deploy_version=deploy_version)
 
 
 with DAG(

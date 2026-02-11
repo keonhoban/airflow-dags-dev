@@ -20,7 +20,6 @@ from ml_code.train_model import train_model, TrainSkippableError
 from ml_code.register_model import register_model
 from ml_code.sensor_model_ready import check_model_ready
 
-# ✅ 충돌 방지: impl로 alias import
 from ml_code.triton_deploy import (
     snapshot_current as triton_snapshot_current_impl,
     materialize as triton_materialize_impl,
@@ -36,13 +35,7 @@ from ml_code.trigger_reload import trigger_reload
 log = LoggingMixin().log
 
 
-# -----------------------
-# Config helpers
-# -----------------------
 def _v(key: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Airflow Variable safe getter
-    """
     try:
         return Variable.get(key)
     except Exception:
@@ -76,7 +69,6 @@ def train_params() -> Tuple[float, int]:
 
 
 def model_name() -> str:
-    # MLflow registered model name == Triton model directory name
     return (_v("triton_model_name", _v("model_name", "best_model")) or "best_model").strip()
 
 
@@ -122,20 +114,12 @@ def train_and_evaluate(**context: Any):
     al = alias()
     env = get_env()
 
-    # downstream 공통 사용 값
     ti.xcom_push(key="alias", value=al)
     ti.xcom_push(key="model_name", value=mname)
 
     try:
-        acc, run_id = train_model(
-            C=c,
-            max_iter=max_iter,
-            feature_uri=feature_uri,
-            fs_version=fs_version,
-            schema_hash=schema_hash,
-        )
+        acc, run_id = train_model(C=c, max_iter=max_iter, feature_uri=feature_uri, fs_version=fs_version, schema_hash=schema_hash)
     except TrainSkippableError as e:
-        # 학습 불가 상황은 shadow 판단을 위해 run_id를 비워둠
         notify_skip("Train skipped", env=env, reason=str(e))
         ti.xcom_push(key="accuracy", value=None)
         ti.xcom_push(key="run_id", value=None)
@@ -144,25 +128,15 @@ def train_and_evaluate(**context: Any):
     ti.xcom_push(key="accuracy", value=float(acc))
     ti.xcom_push(key="run_id", value=run_id)
 
-    notify_info(
-        "Train completed",
-        env=env,
-        accuracy=f"{acc:.4f}",
-        alias=al,
-        run_id=run_id,
-        fs_version=fs_version,
-        schema_hash=schema_hash,
-    )
+    notify_info("Train completed", env=env, accuracy=f"{acc:.4f}", alias=al, run_id=run_id, fs_version=fs_version, schema_hash=schema_hash)
 
 
 def check_result(**context: Any) -> str:
     ti = context["ti"]
     env = get_env()
     th = accuracy_threshold()
-
     acc = ti.xcom_pull(task_ids="train_and_evaluate", key="accuracy")
 
-    # train skipped이면 shadow로
     if acc is None:
         notify_info("Branch: shadow (train skipped)", env=env, threshold=str(th))
         return "shadow_start"
@@ -186,7 +160,6 @@ def check_result(**context: Any) -> str:
 # -----------------------
 def register_model_task(**context: Any):
     ti = context["ti"]
-
     run_id = ti.xcom_pull(task_ids="train_and_evaluate", key="run_id")
     mname = ti.xcom_pull(task_ids="train_and_evaluate", key="model_name") or model_name()
     al = ti.xcom_pull(task_ids="train_and_evaluate", key="alias") or alias()
@@ -196,51 +169,30 @@ def register_model_task(**context: Any):
 
     version = register_model(run_id=run_id, model_name=mname, mlflow_alias=al)
     ti.xcom_push(key="version", value=int(version))
-
-    notify_success(
-        "MLflow register+alias completed",
-        env=get_env(),
-        model=mname,
-        alias=al,
-        version=str(version),
-    )
+    notify_success("MLflow register+alias completed", env=get_env(), model=mname, alias=al, version=str(version))
 
 
 def sensor_ready_func(**context: Any) -> bool:
     ti = context["ti"]
-
     mname = ti.xcom_pull(task_ids="train_and_evaluate", key="model_name") or model_name()
     version = ti.xcom_pull(task_ids="register_model_task", key="version")
-
     if not version:
         raise ValueError("Sensor 불가: version XCom 누락 (register_model_task 확인 필요)")
-
     return check_model_ready(model_name=mname, version=str(version))
 
 
 def notify_failure():
-    env = get_env()
-    notify_skip("Accuracy below threshold", env=env, next_action="feature/label/model 개선 후 재시도")
+    notify_skip("Accuracy below threshold", env=get_env(), next_action="feature/label/model 개선 후 재시도")
 
 
 # -----------------------
-# Triton deploy wrappers (NO name collision)
+# Triton deploy wrappers
 # -----------------------
 def snapshot_current(**context: Any):
-    """
-    ✅ 기존 RecursionError 원인 제거:
-    - wrapper 이름(snapshot_current) != impl(triton_snapshot_current_impl)
-    """
-    ti = context["ti"]
-    return triton_snapshot_current_impl(ti=ti)
+    return triton_snapshot_current_impl(ti=context["ti"])
 
 
 def triton_materialize_task(**context: Any):
-    """
-    공통 배포 단계:
-    - promotion: alias 기반 (레지스트리 alias -> version -> run_id)
-    - shadow: run_id 기반 (레지스트리 없이 배포 검증)
-    """
     ti = context["ti"]
     env = get_env()
 
@@ -250,10 +202,8 @@ def triton_materialize_task(**context: Any):
 
     if version:
         notify_info("Triton deploy: promotion path (alias)", env=env, alias=al, version=str(version))
-        # impl 내부에서 alias -> (version, run_id) 선택
         return triton_materialize_impl(ti=ti, alias=al)
 
-    # shadow
     if not run_id:
         raise ValueError("Shadow deploy 불가: run_id XCom 누락 (train_and_evaluate 확인 필요)")
 
@@ -262,38 +212,34 @@ def triton_materialize_task(**context: Any):
 
 
 def triton_load(**context: Any):
-    ti = context["ti"]
-    return triton_load_impl(ti=ti)
+    return triton_load_impl(ti=context["ti"])
 
 
 def triton_ready(**context: Any):
-    ti = context["ti"]
-    return triton_ready_impl(ti=ti)
+    return triton_ready_impl(ti=context["ti"])
 
 
 def triton_infer_smoke(**context: Any):
-    ti = context["ti"]
-    return triton_infer_smoke_impl(ti=ti)
+    return triton_infer_smoke_impl(ti=context["ti"])
 
 
 def commit_current(**context: Any):
-    ti = context["ti"]
-    return triton_commit_current_impl(ti=ti)
+    return triton_commit_current_impl(ti=context["ti"])
 
 
 def triton_rollback_task(**context: Any):
-    ti = context["ti"]
-    return triton_rollback_minimal_impl(ti=ti)
+    return triton_rollback_minimal_impl(ti=context["ti"])
 
 
 # -----------------------
-# FastAPI reload
+# FastAPI reload (✅ deploy_version로 SSOT 동기화)
 # -----------------------
 def fastapi_reload_task(**context: Any):
     ti = context["ti"]
     env = get_env()
     al = ti.xcom_pull(task_ids="train_and_evaluate", key="alias") or alias()
+    deploy_version = ti.xcom_pull(task_ids="materialize_repo", key="deploy_version")
 
-    trigger_reload(al)
-    notify_success("FastAPI reload completed", env=env, alias=al)
+    trigger_reload(al, deploy_version=int(deploy_version) if deploy_version is not None else None)
+    notify_success("FastAPI reload completed", env=env, alias=al, deploy_version=str(deploy_version))
 
