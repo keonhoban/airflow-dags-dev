@@ -109,7 +109,7 @@ def _kpo(task_id: str, mode: str) -> KubernetesPodOperator:
         cmds=["/bin/sh", "-c"],
         arguments=[_script(mode)],
         env_vars={
-            "AWS_SHARED_CREDENTIALS_FILE": "/root/.aws/credentials",
+            "AWS_SHARED_CREDENTIALS_FILE": "/home/airflow/.aws/credentials",
             "AWS_PROFILE": AWS_PROFILE,
             "AWS_DEFAULT_REGION": AWS_REGION,
             "AWS_REGION": AWS_REGION,
