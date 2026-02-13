@@ -125,7 +125,7 @@ def _kpo(task_id: str, mode: str) -> KubernetesPodOperator:
 with DAG(
     dag_id="feast_materialize_dev",
     start_date=datetime(2026, 2, 1, tzinfo=KST),
-    schedule="*/30 * * * *",
+    schedule=None
     catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["feature-store", "feast", "dev"],
