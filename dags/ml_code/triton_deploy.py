@@ -123,6 +123,7 @@ def _atomic_write(path: str, content: str):
 # -----------------------
 _VERSION_POLICY_RE = re.compile(r"\nversion_policy\s*\{.*?\}\s*\n", re.DOTALL)
 
+
 def _set_version_policy_specific(config_text: str, version: int) -> str:
     vp = f"""
 version_policy {{
@@ -134,6 +135,7 @@ version_policy {{
     if _VERSION_POLICY_RE.search(config_text):
         return _VERSION_POLICY_RE.sub(vp + "\n", config_text)
     return config_text.rstrip() + vp + "\n"
+
 
 def write_or_update_config_policy(model_dir: str, *, version: int):
     config_path = os.path.join(model_dir, "config.pbtxt")
@@ -230,9 +232,17 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
     shutil.copyfile(local, tmp)
     os.replace(tmp, dst)
 
-    # config.pbtxt write + (나중에 policy는 commit/rollback에서 설정)
+    # config.pbtxt write
     os.makedirs(model_dir, exist_ok=True)
-    _atomic_write(os.path.join(model_dir, "config.pbtxt"), build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes))
+    _atomic_write(
+        os.path.join(model_dir, "config.pbtxt"),
+        build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes),
+    )
+
+    # ✅ 핵심: promote는 load 전에 version_policy specific을 고정해야 Triton이 "가장 큰 버전"을 자동 선택하지 않음
+    if mode == "promote":
+        write_or_update_config_policy(model_dir, version=int(deploy_version))
+        log.warning("[materialize] version_policy set BEFORE load: %s", deploy_version)
 
     # xcom
     ti.xcom_push(key="model", value=model)
@@ -251,6 +261,16 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
 def triton_load(ti, **_):
     model = ti.xcom_pull(task_ids="materialize_repo", key="model")
     triton = build_triton_http_url()
+
+    # ✅ unload -> load 로 강제 reload (config/version_policy 변경 반영)
+    try:
+        requests.post(f"{triton}/v2/repository/models/{model}/unload", timeout=10)
+    except Exception:
+        pass
+
+    import time
+    time.sleep(0.3)
+
     r = requests.post(f"{triton}/v2/repository/models/{model}/load", timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"[load] failed: {r.status_code} {r.text}")
@@ -276,10 +296,22 @@ def triton_infer_smoke(ti, **_):
         raise RuntimeError("[smoke] missing n_features")
 
     payload = {
-        "inputs": [{"name": in_name, "shape": [1, n_features], "datatype": "FP32", "data": [[0.0 for _ in range(n_features)]]}]
+        "inputs": [
+            {
+                "name": in_name,
+                "shape": [1, n_features],
+                "datatype": "FP32",
+                "data": [[0.0 for _ in range(n_features)]],
+            }
+        ]
     }
 
-    r = requests.post(f"{triton}/v2/models/{model}/infer", headers={"Content-Type": "application/json"}, json=payload, timeout=10)
+    r = requests.post(
+        f"{triton}/v2/models/{model}/infer",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=10,
+    )
     if r.status_code != 200:
         raise RuntimeError(f"[infer] failed: {r.status_code} {r.text}")
 
@@ -290,7 +322,8 @@ def commit_current(ti, **_):
     """
     ✅ promotion 성공 시:
     - current.json 기록
-    - config.pbtxt version_policy specific = deploy_version (SSOT)
+    - (중복 허용) config.pbtxt version_policy specific = deploy_version (SSOT)
+      ※ 실제로는 materialize()에서 이미 "load 전에" 정책을 고정함
     """
     model_dir = ti.xcom_pull(task_ids="materialize_repo", key="model_dir")
     deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key="deploy_mode")
@@ -317,7 +350,9 @@ def commit_current(ti, **_):
         json.dump(payload, f, indent=2)
     os.replace(tmp, path)
 
+    # (중복 세팅: 안전하게 유지)
     write_or_update_config_policy(model_dir, version=deploy_version)
+
     log.info("[commit] OK version=%s path=%s", deploy_version, path)
 
 
@@ -358,6 +393,7 @@ def rollback_minimal(ti, **_):
     except Exception as e:
         log.warning("[ROLLBACK] reload failed: %s", e)
 
+
 def rebuild_config_for_version(model: str, version: int) -> str:
     run_id = run_id_by_version(model, int(version))
     params = get_run_params(run_id)
@@ -381,6 +417,7 @@ def rebuild_config_for_version(model: str, version: int) -> str:
     base = build_config_pbtxt(model, in_name, out_prob, out_label, n_features, n_classes)
     clean = _set_version_policy_specific(base, int(version))
     return clean
+
 
 def rollback_manual(model: str | None = None, deploy_version: int | None = None):
     model = model or cfg("triton_model_name", required=True)
