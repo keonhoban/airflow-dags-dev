@@ -42,12 +42,15 @@ def _read_parquet_from_s3(feature_uri: str) -> pd.DataFrame:
     return pd.read_parquet(io.BytesIO(data))
 
 
-def _validate_onnx_file(onnx_path: str, *, min_bytes: int = 10_000) -> None:
+def _validate_onnx_file(onnx_path: str, *, warn_bytes: int = 10_000) -> None:
     """
     ✅ ONNX 무결성 게이트 (downstream(Triton) 보호)
-    - 파일 존재
-    - 최소 크기 (너무 작은 ONNX는 운영에서 위험 신호)
-    - onnx.load + onnx.checker
+
+    - 파일 존재/0바이트 방지
+    - onnx.load() 가능해야 함
+    - onnx.checker.check_model() 통과해야 함
+    - graph 최소 sanity (node/input/output)
+    - 크기는 "실패 조건"이 아니라 "경고"로만 사용 (LR 같은 모델은 매우 작을 수 있음)
     """
     import onnx
 
@@ -55,23 +58,40 @@ def _validate_onnx_file(onnx_path: str, *, min_bytes: int = 10_000) -> None:
         raise RuntimeError(f"[ONNX] missing file: {onnx_path}")
 
     sz = os.path.getsize(onnx_path)
-    # 데모라면 낮춰도 되지만, 지금처럼 513 bytes 같은 케이스를 막기 위해 기본은 10KB
-    if sz < min_bytes:
-        raise RuntimeError(f"[ONNX] too small size={sz} (<{min_bytes}) path={onnx_path}")
+    if sz <= 0:
+        raise RuntimeError(f"[ONNX] empty file size={sz} path={onnx_path}")
 
-    m = onnx.load(onnx_path)
+    try:
+        m = onnx.load(onnx_path)
+    except Exception as e:
+        raise RuntimeError(f"[ONNX] load failed: {e} path={onnx_path}") from e
+
     # graph 최소 sanity
-    if len(m.graph.node) < 1:
-        raise RuntimeError(f"[ONNX] empty graph nodes={len(m.graph.node)} path={onnx_path}")
+    n_nodes = len(m.graph.node)
+    n_ins = len(m.graph.input)
+    n_outs = len(m.graph.output)
+    if n_nodes < 1:
+        raise RuntimeError(f"[ONNX] empty graph nodes={n_nodes} path={onnx_path}")
+    if n_ins < 1 or n_outs < 1:
+        raise RuntimeError(f"[ONNX] invalid io inputs={n_ins} outputs={n_outs} path={onnx_path}")
 
     try:
         onnx.checker.check_model(m)
     except Exception as e:
-        raise RuntimeError(f"[ONNX] checker failed: {e}") from e
+        raise RuntimeError(f"[ONNX] checker failed: {e} path={onnx_path}") from e
 
     ins = [i.name for i in m.graph.input]
     outs = [o.name for o in m.graph.output]
-    logger.info("[ONNX] validated OK size=%s nodes=%s inputs=%s outputs=%s", sz, len(m.graph.node), ins, outs)
+
+    if sz < warn_bytes:
+        logger.warning(
+            "[ONNX] validated OK but very small size=%s (<%s). model might be tiny (e.g., LogisticRegression). path=%s",
+            sz,
+            warn_bytes,
+            onnx_path,
+        )
+    else:
+        logger.info("[ONNX] validated OK size=%s nodes=%s inputs=%s outputs=%s", sz, n_nodes, ins, outs)
 
 
 def export_onnx_and_log_artifact(clf, n_features: int):
