@@ -17,7 +17,7 @@ from utils.slack_alerts import alert_slack
 
 kst = timezone("Asia/Seoul")
 
-# ---- 운영 표준(면접에서 말할 수 있는 기본값) ----
+# ---- 운영 표준(기본값) ----
 DEFAULT_ARGS = {
     "start_date": datetime(2025, 1, 1, tzinfo=kst),
     "retries": 1,
@@ -35,8 +35,9 @@ DAG_KWARGS = dict(
     dagrun_timeout=timedelta(minutes=30),  # 운영 관점: 무한 러닝 방지
 )
 
-# task factory: DAG 파일 “읽기 3분 컷”용
+
 def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
+    """DAG 파일 압축용 task factory"""
     return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
 
 
@@ -52,11 +53,7 @@ with DAG(**DAG_KWARGS) as dag:
 
         extract_raw_data >> validate_data >> build_features >> store_features
 
-    summarize_run = mk_py(
-        "summarize_run",
-        p.dp_summary,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
+    summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
     # -----------------------
     # 2) Train / Branch
@@ -112,11 +109,7 @@ with DAG(**DAG_KWARGS) as dag:
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    rollback_minimal = mk_py(
-        "rollback_minimal",
-        p.triton_rollback_task,
-        trigger_rule=TriggerRule.ONE_FAILED,
-    )
+    rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
 
     # -----------------------
     # 5) Promotion-only state changes
@@ -140,5 +133,8 @@ with DAG(**DAG_KWARGS) as dag:
     # rollback은 deploy chain/commit까지 실패를 모두 커버
     [deploy, commit_current] >> rollback_minimal
 
-    # summarize는 항상 마지막에 모으기
-    [dp.store_features, fastapi_reload, rollback_minimal, notify_failure] >> summarize_run
+    # summarize는 항상 마지막에 모으기 (TaskGroup 속성 접근 금지)
+    store_features >> summarize_run
+    fastapi_reload >> summarize_run
+    rollback_minimal >> summarize_run
+    notify_failure >> summarize_run

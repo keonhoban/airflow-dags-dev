@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from airflow.models import Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
@@ -84,6 +84,29 @@ class Settings:
 
 
 # -----------------------
+# Data pipeline wrappers (TaskGroup에서 바로 부름)
+# -----------------------
+def dp_extract(**context: Any):
+    return dp_extract(**context)
+
+
+def dp_validate(**context: Any):
+    return dp_validate(**context)
+
+
+def dp_build(**context: Any):
+    return dp_build(**context)
+
+
+def dp_store(**context: Any):
+    return dp_store(**context)
+
+
+def dp_summary(**context: Any):
+    return dp_summary(**context)
+
+
+# -----------------------
 # Train / Branch
 # -----------------------
 def train_and_evaluate(**context: Any) -> None:
@@ -94,7 +117,6 @@ def train_and_evaluate(**context: Any) -> None:
     fs_version = ti.xcom_pull(key="fs_version", task_ids="store_features")
     schema_hash = ti.xcom_pull(key="fs_schema_hash", task_ids="build_features")
 
-    # downstream에서 항상 쓸 값은 미리 고정
     ti.xcom_push(key="alias", value=s.alias)
     ti.xcom_push(key="model_name", value=s.model_name)
 
