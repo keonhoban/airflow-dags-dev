@@ -120,9 +120,10 @@ def train_and_evaluate(**context: Any) -> None:
     s = Settings.load()
     ti = context["ti"]
 
-    feature_uri = ti.xcom_pull(key="fs_feature_uri", task_ids="store_features")
-    fs_version = ti.xcom_pull(key="fs_version", task_ids="store_features")
-    schema_hash = ti.xcom_pull(key="fs_schema_hash", task_ids="build_features")
+    # ✅ TaskGroup 쓰면 task_id가 "dp.store_features" 형태가 됩니다.
+    feature_uri = ti.xcom_pull(key="fs_feature_uri", task_ids="dp.store_features")
+    fs_version = ti.xcom_pull(key="fs_version", task_ids="dp.store_features")
+    schema_hash = ti.xcom_pull(key="fs_schema_hash", task_ids="dp.build_features")
 
     ti.xcom_push(key="alias", value=s.alias)
     ti.xcom_push(key="model_name", value=s.model_name)
@@ -231,23 +232,13 @@ def triton_materialize_task(**context: Any) -> None:
     version = ti.xcom_pull(task_ids="register_model_task", key="version")
 
     if version:
-        notify_info(
-            "Triton deploy: promotion path (alias->MLflow version)",
-            env=s.env,
-            alias=str(al),
-            version=str(version),
-        )
+        notify_info("Triton deploy: promotion path (alias->MLflow version)", env=s.env, alias=str(al), version=str(version))
         return triton_materialize(ti=ti, alias=str(al), shadow=False)
 
     if not run_id:
         raise ValueError("Shadow deploy 불가: run_id XCom 누락 (train_and_evaluate 확인 필요)")
 
-    notify_info(
-        "Triton deploy: shadow path (run_id->timestamp)",
-        env=s.env,
-        alias=str(al),
-        run_id=str(run_id),
-    )
+    notify_info("Triton deploy: shadow path (run_id->timestamp)", env=s.env, alias=str(al), run_id=str(run_id))
     return triton_materialize(ti=ti, alias=str(al), run_id=str(run_id), shadow=True)
 
 
@@ -280,31 +271,19 @@ def fastapi_reload_task(**context: Any) -> None:
 
     al = ti.xcom_pull(task_ids="train_and_evaluate", key="alias") or s.alias
 
-    deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key="deploy_mode") or "promote"
-    deploy_version = ti.xcom_pull(task_ids="materialize_repo", key="deploy_version")
-    run_id = ti.xcom_pull(task_ids="materialize_repo", key="run_id")
+    deploy_mode = ti.xcom_pull(task_ids="deploy.materialize_repo", key="deploy_mode") or "promote"
+    deploy_version = ti.xcom_pull(task_ids="deploy.materialize_repo", key="deploy_version")
+    run_id = ti.xcom_pull(task_ids="deploy.materialize_repo", key="run_id")
 
     if str(deploy_mode) == "shadow":
         if not run_id:
-            raise ValueError("FastAPI shadow reload 불가: run_id XCom 누락 (materialize_repo 확인 필요)")
+            raise ValueError("FastAPI shadow reload 불가: run_id XCom 누락 (deploy.materialize_repo 확인 필요)")
         trigger_reload(str(al), run_id=str(run_id))
-        notify_success(
-            "FastAPI reload completed (shadow/run_id)",
-            env=s.env,
-            alias=str(al),
-            run_id=str(run_id),
-        )
+        notify_success("FastAPI reload completed (shadow/run_id)", env=s.env, alias=str(al), run_id=str(run_id))
         return
 
     if deploy_version is None:
-        raise ValueError("FastAPI promotion reload 불가: deploy_version XCom 누락 (materialize_repo 확인 필요)")
+        raise ValueError("FastAPI promotion reload 불가: deploy_version XCom 누락 (deploy.materialize_repo 확인 필요)")
 
     trigger_reload(str(al), deploy_version=int(deploy_version))
-    notify_success(
-        "FastAPI reload completed (promotion/deploy_version)",
-        env=s.env,
-        alias=str(al),
-        deploy_version=str(deploy_version),
-    )
-
-# touch: refresh import errors 2026-02-26T13:50:39+09:00
+    notify_success("FastAPI reload completed (promotion/deploy_version)", env=s.env, alias=str(al), deploy_version=str(deploy_version))

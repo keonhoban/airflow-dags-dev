@@ -17,7 +17,6 @@ from utils.slack_alerts import alert_slack
 
 kst = timezone("Asia/Seoul")
 
-# ---- 운영 표준(기본값) ----
 DEFAULT_ARGS = {
     "start_date": datetime(2025, 1, 1, tzinfo=kst),
     "retries": 1,
@@ -32,19 +31,16 @@ DAG_KWARGS = dict(
     max_active_runs=1,
     tags=["e2e", "mlops", "triton", "mlflow"],
     on_failure_callback=alert_slack,
-    dagrun_timeout=timedelta(minutes=30),  # 운영 관점: 무한 러닝 방지
+    dagrun_timeout=timedelta(minutes=30),
 )
 
 
 def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
-    """DAG 파일 압축용 task factory"""
     return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
 
 
 with DAG(**DAG_KWARGS) as dag:
-    # -----------------------
-    # 1) Data pipeline (Feature Store-lite)
-    # -----------------------
+    # 1) Data pipeline
     with TaskGroup(group_id="dp") as dp:
         extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
         validate_data = mk_py("validate_data", p.dp_validate)
@@ -55,9 +51,7 @@ with DAG(**DAG_KWARGS) as dag:
 
     summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
-    # -----------------------
     # 2) Train / Branch
-    # -----------------------
     train = mk_py("train_and_evaluate", p.train_and_evaluate)
 
     branch = BranchPythonOperator(
@@ -65,9 +59,7 @@ with DAG(**DAG_KWARGS) as dag:
         python_callable=p.check_result,  # -> register_model_task OR shadow_start
     )
 
-    # -----------------------
-    # 3) Promotion path (register -> sensor)
-    # -----------------------
+    # 3) Promotion path
     promotion_start = EmptyOperator(task_id="promotion_start")
     shadow_start = EmptyOperator(task_id="shadow_start")
 
@@ -87,16 +79,13 @@ with DAG(**DAG_KWARGS) as dag:
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    # -----------------------
-    # 4) Common deploy chain (promotion + shadow)
-    # -----------------------
+    # 4) Deploy chain
     with TaskGroup(group_id="deploy") as deploy:
         snapshot_current = mk_py(
             "snapshot_current",
             p.snapshot_current,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
-
         materialize_repo = mk_py(
             "materialize_repo",
             p.triton_materialize_task,
@@ -111,15 +100,11 @@ with DAG(**DAG_KWARGS) as dag:
 
     rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
 
-    # -----------------------
-    # 5) Promotion-only state changes
-    # -----------------------
+    # 5) Promotion-only
     commit_current = mk_py("commit_current", p.commit_current)
     fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
 
-    # -----------------------
-    # Dependencies (핵심 흐름만 남김)
-    # -----------------------
+    # Dependencies
     dp >> train >> branch
 
     branch >> register >> promotion_start
@@ -130,10 +115,8 @@ with DAG(**DAG_KWARGS) as dag:
 
     deploy >> commit_current >> fastapi_reload
 
-    # rollback은 deploy chain/commit까지 실패를 모두 커버
     [deploy, commit_current] >> rollback_minimal
 
-    # summarize는 항상 마지막에 모으기 (TaskGroup 속성 접근 금지)
     store_features >> summarize_run
     fastapi_reload >> summarize_run
     rollback_minimal >> summarize_run
