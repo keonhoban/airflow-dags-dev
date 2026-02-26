@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from airflow.utils.log.logging_mixin import LoggingMixin
 
@@ -33,6 +33,25 @@ K_DEPLOY_MODE = "deploy_mode"
 K_N_FEATURES = "n_features"
 K_N_CLASSES = "n_classes"
 K_ONNX_INPUT_NAME = "onnx_input_name"
+
+# Task IDs (TaskGroup 고려: SSOT)
+T_MAT = ("deploy.materialize_repo", "materialize_repo")
+T_SNAPSHOT = ("deploy.snapshot_current", "snapshot_current")
+
+
+def _xcom_pull_any(ti, *, key: str, task_ids: Sequence[str]) -> Optional[Any]:
+    for tid in task_ids:
+        v = ti.xcom_pull(task_ids=tid, key=key)
+        if v is not None:
+            return v
+    return None
+
+
+def _require_xcom(ti, *, key: str, task_ids: Sequence[str], hint: str) -> Any:
+    v = _xcom_pull_any(ti, key=key, task_ids=task_ids)
+    if v is None or v == "":
+        raise RuntimeError(f"XCom missing: key='{key}' from task_ids={list(task_ids)}. Hint: {hint}")
+    return v
 
 
 def snapshot_current(ti, **_) -> None:
@@ -65,6 +84,7 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
 
     meta = materialize_repo(model=model, deploy_version=int(deploy_version), run_id=str(chosen_run_id))
 
+    # ✅ materialize_repo task에서 downstream이 쓰는 값들 전부 push
     ti.xcom_push(key=K_MODEL, value=meta[K_MODEL])
     ti.xcom_push(key=K_MODEL_DIR, value=meta[K_MODEL_DIR])
     ti.xcom_push(key=K_DEPLOY_VERSION, value=int(meta[K_DEPLOY_VERSION]))
@@ -75,33 +95,44 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
     ti.xcom_push(key=K_N_CLASSES, value=int(meta[K_N_CLASSES]))
     ti.xcom_push(key=K_ONNX_INPUT_NAME, value=meta[K_ONNX_INPUT_NAME])
 
-    log.info("[materialize] mode=%s model=%s alias=@%s version=%s run_id=%s", mode, model, used_alias, deploy_version, chosen_run_id)
+    log.info(
+        "[materialize] mode=%s model=%s alias=@%s version=%s run_id=%s",
+        mode,
+        meta[K_MODEL],
+        used_alias,
+        meta[K_DEPLOY_VERSION],
+        meta[K_RUN_ID],
+    )
 
 
 def triton_load_task(ti, **_) -> None:
-    model = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL)
-    # 정석: unload -> load (대기 없음; ready는 Sensor/다음 task에서)
+    model = _require_xcom(
+        ti,
+        key=K_MODEL,
+        task_ids=T_MAT,
+        hint="materialize_repo가 TaskGroup deploy 아래면 task_id는 'deploy.materialize_repo' 입니다.",
+    )
     triton_unload(str(model))
     triton_load(str(model))
 
 
 def triton_ready_task(ti, **_) -> None:
-    model = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL)
+    model = _require_xcom(ti, key=K_MODEL, task_ids=T_MAT, hint="Check TaskGroup prefix deploy.*")
     triton_ready(str(model))
 
 
 def triton_infer_smoke_task(ti, **_) -> None:
-    model = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL)
-    n_features = int(ti.xcom_pull(task_ids="materialize_repo", key=K_N_FEATURES) or 0)
-    in_name = ti.xcom_pull(task_ids="materialize_repo", key=K_ONNX_INPUT_NAME) or "input"
+    model = _require_xcom(ti, key=K_MODEL, task_ids=T_MAT, hint="Check TaskGroup prefix deploy.*")
+    n_features = int(_xcom_pull_any(ti, key=K_N_FEATURES, task_ids=T_MAT) or 0)
+    in_name = _xcom_pull_any(ti, key=K_ONNX_INPUT_NAME, task_ids=T_MAT) or "input"
     _ = triton_infer_smoke(str(model), in_name=str(in_name), n_features=int(n_features))
 
 
 def commit_current(ti, **_) -> None:
-    model = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL)
+    model = _require_xcom(ti, key=K_MODEL, task_ids=T_MAT, hint="Check TaskGroup prefix deploy.*")
     base_model = cfg("triton_model_name", required=True)
 
-    deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key=K_DEPLOY_MODE)
+    deploy_mode = _xcom_pull_any(ti, key=K_DEPLOY_MODE, task_ids=T_MAT)
     if str(deploy_mode) == "shadow":
         log.warning("[commit] skip current.json for shadow model=%s", model)
         return
@@ -109,10 +140,10 @@ def commit_current(ti, **_) -> None:
     if str(model) != str(base_model):
         raise RuntimeError(f"[commit] unexpected promote model={model} (base_model={base_model})")
 
-    model_dir = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL_DIR)
-    deploy_version = int(ti.xcom_pull(task_ids="materialize_repo", key=K_DEPLOY_VERSION))
-    run_id = ti.xcom_pull(task_ids="materialize_repo", key=K_RUN_ID)
-    alias = ti.xcom_pull(task_ids="materialize_repo", key=K_ALIAS)
+    model_dir = _require_xcom(ti, key=K_MODEL_DIR, task_ids=T_MAT, hint="materialize must push model_dir")
+    deploy_version = int(_require_xcom(ti, key=K_DEPLOY_VERSION, task_ids=T_MAT, hint="materialize must push deploy_version"))
+    run_id = _xcom_pull_any(ti, key=K_RUN_ID, task_ids=T_MAT)
+    alias = _xcom_pull_any(ti, key=K_ALIAS, task_ids=T_MAT)
 
     payload = {
         "active_version": deploy_version,
@@ -125,28 +156,28 @@ def commit_current(ti, **_) -> None:
     path = os.path.join(str(model_dir), "current.json")
     atomic_write(path, json.dumps(payload, indent=2))
 
-    # policy 정화 포함 재적용
     write_or_update_config_policy(str(model_dir), version=deploy_version)
     log.info("[commit] OK version=%s path=%s", deploy_version, path)
 
 
 def rollback_minimal(ti, **_) -> None:
-    model = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL)
-    model_dir = ti.xcom_pull(task_ids="materialize_repo", key=K_MODEL_DIR)
-    deploy_v = ti.xcom_pull(task_ids="materialize_repo", key=K_DEPLOY_VERSION)
-    deploy_mode = ti.xcom_pull(task_ids="materialize_repo", key=K_DEPLOY_MODE)
-    prev = ti.xcom_pull(task_ids="snapshot_current", key="prev_current")
+    model = _require_xcom(ti, key=K_MODEL, task_ids=T_MAT, hint="Check TaskGroup prefix deploy.*")
+    model_dir = _xcom_pull_any(ti, key=K_MODEL_DIR, task_ids=T_MAT)
+    deploy_v = _xcom_pull_any(ti, key=K_DEPLOY_VERSION, task_ids=T_MAT)
+    deploy_mode = _xcom_pull_any(ti, key=K_DEPLOY_MODE, task_ids=T_MAT)
+
+    prev = _xcom_pull_any(ti, key="prev_current", task_ids=T_SNAPSHOT)
 
     log.warning("[ROLLBACK] start model=%s deploy_version=%s mode=%s", model, deploy_v, deploy_mode)
 
     base_model = cfg("triton_model_name", required=True)
 
-    if str(deploy_mode) != "shadow" and str(model) == str(base_model) and prev is not None:
+    if str(deploy_mode) != "shadow" and str(model) == str(base_model) and prev is not None and model_dir:
         path = os.path.join(str(model_dir), "current.json")
         atomic_write(path, json.dumps(prev, indent=2))
         log.warning("[ROLLBACK] restored current.json (promote)")
 
-    if deploy_v is not None:
+    if deploy_v is not None and model_dir:
         ver_dir = os.path.join(str(model_dir), str(deploy_v))
         if os.path.isdir(ver_dir):
             failed_dir = ver_dir + f".failed_{utc_ts()}"
