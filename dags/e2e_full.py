@@ -2,85 +2,81 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+
 from pendulum import timezone
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.sensors.python import PythonSensor
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.sensors.python import PythonSensor
+from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
-from utils.slack_alerts import alert_slack
 from pipelines import full_e2e as p
+from utils.slack_alerts import alert_slack
 
 kst = timezone("Asia/Seoul")
-default_args = {
+
+# ---- 운영 표준(면접에서 말할 수 있는 기본값) ----
+DEFAULT_ARGS = {
     "start_date": datetime(2025, 1, 1, tzinfo=kst),
     "retries": 1,
     "retry_delay": timedelta(minutes=2),
 }
 
-with DAG(
+DAG_KWARGS = dict(
     dag_id="e2e_full",
-    default_args=default_args,
+    default_args=DEFAULT_ARGS,
     schedule=None,
     catchup=False,
     max_active_runs=1,
     tags=["e2e", "mlops", "triton", "mlflow"],
     on_failure_callback=alert_slack,
-) as dag:
+    dagrun_timeout=timedelta(minutes=30),  # 운영 관점: 무한 러닝 방지
+)
 
+# task factory: DAG 파일 “읽기 3분 컷”용
+def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
+    return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
+
+
+with DAG(**DAG_KWARGS) as dag:
     # -----------------------
-    # Data pipeline (Feature Store-lite)
+    # 1) Data pipeline (Feature Store-lite)
     # -----------------------
-    extract_raw_data = PythonOperator(
-        task_id="extract_raw_data",
-        python_callable=p.dp_extract,
-    )
+    with TaskGroup(group_id="dp") as dp:
+        extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
+        validate_data = mk_py("validate_data", p.dp_validate)
+        build_features = mk_py("build_features", p.dp_build)
+        store_features = mk_py("store_features", p.dp_store)
 
-    validate_data = PythonOperator(
-        task_id="validate_data",
-        python_callable=p.dp_validate,
-    )
+        extract_raw_data >> validate_data >> build_features >> store_features
 
-    build_features = PythonOperator(
-        task_id="build_features",
-        python_callable=p.dp_build,
-    )
-
-    store_features = PythonOperator(
-        task_id="store_features",
-        python_callable=p.dp_store,
-    )
-
-    summarize_run = PythonOperator(
-        task_id="summarize_run",
-        python_callable=p.dp_summary,
+    summarize_run = mk_py(
+        "summarize_run",
+        p.dp_summary,
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # -----------------------
-    # Train / Branch
+    # 2) Train / Branch
     # -----------------------
-    train = PythonOperator(
-        task_id="train_and_evaluate",
-        python_callable=p.train_and_evaluate,
-    )
+    train = mk_py("train_and_evaluate", p.train_and_evaluate)
 
     branch = BranchPythonOperator(
         task_id="check_result",
-        python_callable=p.check_result,  # pass -> register_path / fail -> shadow_path
+        python_callable=p.check_result,  # -> register_model_task OR shadow_start
     )
 
     # -----------------------
-    # Promotion path
+    # 3) Promotion path (register -> sensor)
     # -----------------------
-    register = PythonOperator(
-        task_id="register_model_task",
-        python_callable=p.register_model_task,
-    )
+    promotion_start = EmptyOperator(task_id="promotion_start")
+    shadow_start = EmptyOperator(task_id="shadow_start")
 
-    sensor = PythonSensor(
+    register = mk_py("register_model_task", p.register_model_task)
+
+    check_model_ready = PythonSensor(
         task_id="check_model_ready",
         python_callable=p.sensor_ready_func,
         poke_interval=10,
@@ -88,85 +84,61 @@ with DAG(
         mode="reschedule",
     )
 
-    promotion_start = EmptyOperator(task_id="promotion_start")
-    shadow_start = EmptyOperator(task_id="shadow_start")
-
-    notify_failure = PythonOperator(
-        task_id="notify_failure",
-        python_callable=p.notify_failure,
+    notify_failure = mk_py(
+        "notify_failure",
+        p.notify_failure,
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     # -----------------------
-    # Common deploy chain (both paths)
+    # 4) Common deploy chain (promotion + shadow)
     # -----------------------
-    snap = PythonOperator(
-        task_id="snapshot_current",
-        python_callable=p.snapshot_current,
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
-    )
+    with TaskGroup(group_id="deploy") as deploy:
+        snapshot_current = mk_py(
+            "snapshot_current",
+            p.snapshot_current,
+            trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+        )
 
-    mat = PythonOperator(
-        task_id="materialize_repo",
-        python_callable=p.triton_materialize_task,
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
-    )
+        materialize_repo = mk_py(
+            "materialize_repo",
+            p.triton_materialize_task,
+            trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+        )
 
-    load = PythonOperator(
-        task_id="triton_load",
-        python_callable=p.triton_load,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
+        triton_load = mk_py("triton_load", p.triton_load_task)
+        triton_ready = mk_py("triton_ready", p.triton_ready_task)
+        triton_infer_smoke = mk_py("triton_infer_smoke", p.triton_infer_smoke_task)
 
-    ready = PythonOperator(
-        task_id="triton_ready",
-        python_callable=p.triton_ready,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
+        snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    smoke = PythonOperator(
-        task_id="triton_infer_smoke",
-        python_callable=p.triton_infer_smoke,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
-
-    rb = PythonOperator(
-        task_id="rollback_minimal",
-        python_callable=p.triton_rollback_task,
+    rollback_minimal = mk_py(
+        "rollback_minimal",
+        p.triton_rollback_task,
         trigger_rule=TriggerRule.ONE_FAILED,
     )
 
     # -----------------------
-    # Promotion-only state changes
+    # 5) Promotion-only state changes
     # -----------------------
-    commit = PythonOperator(
-        task_id="commit_current",
-        python_callable=p.commit_current,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
-
-    fastapi_reload = PythonOperator(
-        task_id="fastapi_reload",
-        python_callable=p.fastapi_reload_task,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
+    commit_current = mk_py("commit_current", p.commit_current)
+    fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
 
     # -----------------------
-    # Dependencies
+    # Dependencies (핵심 흐름만 남김)
     # -----------------------
-    extract_raw_data >> validate_data >> build_features >> store_features
-    store_features >> train >> branch
+    dp >> train >> branch
 
     branch >> register >> promotion_start
     branch >> shadow_start >> notify_failure
 
-    promotion_start >> sensor >> snap
-    shadow_start >> snap
+    promotion_start >> check_model_ready >> deploy
+    shadow_start >> deploy
 
-    snap >> mat >> load >> ready >> smoke
+    deploy >> commit_current >> fastapi_reload
 
-    smoke >> commit >> fastapi_reload
+    # rollback은 deploy chain/commit까지 실패를 모두 커버
+    [deploy, commit_current] >> rollback_minimal
 
-    [mat, load, ready, smoke, commit] >> rb
-    [store_features, fastapi_reload, rb, notify_failure] >> summarize_run
-
+    # summarize는 항상 마지막에 모으기
+    [dp.store_features, fastapi_reload, rollback_minimal, notify_failure] >> summarize_run
