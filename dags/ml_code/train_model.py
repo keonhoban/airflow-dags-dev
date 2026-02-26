@@ -1,3 +1,4 @@
+# dags/ml_code/train_model.py
 import io
 import os
 import boto3
@@ -41,6 +42,38 @@ def _read_parquet_from_s3(feature_uri: str) -> pd.DataFrame:
     return pd.read_parquet(io.BytesIO(data))
 
 
+def _validate_onnx_file(onnx_path: str, *, min_bytes: int = 10_000) -> None:
+    """
+    ✅ ONNX 무결성 게이트 (downstream(Triton) 보호)
+    - 파일 존재
+    - 최소 크기 (너무 작은 ONNX는 운영에서 위험 신호)
+    - onnx.load + onnx.checker
+    """
+    import onnx
+
+    if not os.path.exists(onnx_path):
+        raise RuntimeError(f"[ONNX] missing file: {onnx_path}")
+
+    sz = os.path.getsize(onnx_path)
+    # 데모라면 낮춰도 되지만, 지금처럼 513 bytes 같은 케이스를 막기 위해 기본은 10KB
+    if sz < min_bytes:
+        raise RuntimeError(f"[ONNX] too small size={sz} (<{min_bytes}) path={onnx_path}")
+
+    m = onnx.load(onnx_path)
+    # graph 최소 sanity
+    if len(m.graph.node) < 1:
+        raise RuntimeError(f"[ONNX] empty graph nodes={len(m.graph.node)} path={onnx_path}")
+
+    try:
+        onnx.checker.check_model(m)
+    except Exception as e:
+        raise RuntimeError(f"[ONNX] checker failed: {e}") from e
+
+    ins = [i.name for i in m.graph.input]
+    outs = [o.name for o in m.graph.output]
+    logger.info("[ONNX] validated OK size=%s nodes=%s inputs=%s outputs=%s", sz, len(m.graph.node), ins, outs)
+
+
 def export_onnx_and_log_artifact(clf, n_features: int):
     initial_type = [("input", FloatTensorType([None, n_features]))]
     onnx_model = convert_sklearn(
@@ -49,6 +82,7 @@ def export_onnx_and_log_artifact(clf, n_features: int):
         options={id(clf): {"zipmap": False}},
     )
 
+    # io names -> params
     try:
         in_name = onnx_model.graph.input[0].name
         out_names = [o.name for o in onnx_model.graph.output]
@@ -61,6 +95,9 @@ def export_onnx_and_log_artifact(clf, n_features: int):
     onnx_path = "/tmp/model.onnx"
     with open(onnx_path, "wb") as f:
         f.write(onnx_model.SerializeToString())
+
+    # ✅ 핵심: log_artifact 전에 검증 통과 못 하면 FAIL
+    _validate_onnx_file(onnx_path)
 
     mlflow.log_artifact(onnx_path, artifact_path="onnx")
     logger.info("[ONNX] logged: onnx/model.onnx")
@@ -85,11 +122,9 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
     if missing:
         raise TrainSkippableError(f"학습 스킵: feature 컬럼 누락 {missing}")
 
-    # ✅ label은 DP에서 생성되어 있어야 함
     if "label" not in df.columns:
         raise TrainSkippableError("학습 스킵: label 컬럼이 없습니다 (DP build 단계에서 label 생성 필요)")
 
-    # 품질 체크: 데이터 너무 작으면 학습 의미 없음
     if len(df) < 20:
         raise TrainSkippableError(f"학습 스킵: rows={len(df)} (데모 최소 20 권장, 운영은 200+ 권장)")
 
@@ -98,13 +133,11 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
     if len(uniq) < 2:
         raise TrainSkippableError(f"학습 스킵: 클래스 부족 (unique={uniq})")
 
-    # 각 클래스 최소 샘플 수 체크(너무 불균형하면 split/학습이 의미 없거나 깨짐)
     vc = y.value_counts()
-    if (vc.min() < 3):
+    if vc.min() < 3:
         raise TrainSkippableError(f"학습 스킵: 클래스 불균형(최소 class count={int(vc.min())}) {vc.to_dict()}")
 
     X = df[feature_cols]
-
     logger.info("[TRAIN] feature_uri=%s rows=%d classes=%s", feature_uri, len(df), uniq)
 
     try:
@@ -115,7 +148,7 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
     with mlflow.start_run(experiment_id=experiment_id) as run:
         run_id = run.info.run_id
 
-        # ✅ tags에 lineage 남기기 (지금 tags null 문제 해결)
+        # tags lineage
         if env:
             mlflow.set_tag("env", str(env))
         if fs_version:
@@ -146,10 +179,11 @@ def train_model(C, max_iter, feature_uri=None, fs_version=None, schema_hash=None
         mlflow.log_metric("accuracy", float(acc))
         mlflow.log_metric("f1_macro", float(f1m))
 
-        # model artifacts
+        # artifacts
         mlflow.sklearn.log_model(clf, "model")
+
+        # ✅ 여기서 ONNX 검증 실패하면 run은 남더라도 artifact(onnx)는 안 올라가고 task는 fail
         export_onnx_and_log_artifact(clf, n_features=X.shape[1])
 
         logger.info("[TRAIN] acc=%.4f f1_macro=%.4f run_id=%s", acc, f1m, run_id)
         return float(acc), run_id
-

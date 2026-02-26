@@ -12,9 +12,7 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from ml_code.config import cfg, get_mlflow_client, get_tracking_uri
 from mlops_lib.core.triton_config import (
     build_config_pbtxt,
-    parse_output_names,
-    set_version_policy_specific,
-    write_config_with_policy_atomic,
+    write_config_atomic,
     atomic_write,
 )
 from mlops_lib.infra.http import request_ok, request_json
@@ -59,7 +57,7 @@ def run_id_by_version(model_name: str, version: int) -> str:
     return str(mv.run_id)
 
 
-# ---------- Triton HTTP actions (no wait/sleep) ----------
+# ---------- Triton HTTP actions ----------
 def triton_unload(model: str) -> None:
     triton = build_triton_http_url()
     try:
@@ -137,7 +135,7 @@ def materialize_repo(
 ) -> Dict[str, Any]:
     """
     - 모델 artifact 다운로드 → /models/<model>/<deploy_version>/model.onnx
-    - config.pbtxt 생성 + version_policy specific 적용
+    - ✅ config.pbtxt는 version_policy 없이 '고정 형태'로 생성/유지
     """
     repo = cfg("triton_repo_base", "/models")
     onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
@@ -149,7 +147,10 @@ def materialize_repo(
     n_features = int(params.get("n_features", "0") or "0")
     n_classes = int(params.get("n_classes", "0") or "0")
     in_name = params.get("onnx_input_name", "input")
-    outs = parse_output_names(params.get("onnx_output_names", ""))
+
+    # outputs
+    outs_raw = params.get("onnx_output_names", "")
+    outs = [x.strip() for x in outs_raw.split(",") if x.strip()]
 
     out_label = "label"
     out_prob = "probabilities"
@@ -162,7 +163,7 @@ def materialize_repo(
             if "prob" in cand.lower():
                 out_prob = cand
                 break
-        if len(outs) >= 2 and out_label not in outs and out_prob not in outs:
+        if len(outs) >= 2 and (out_label not in outs or out_prob not in outs):
             out_label, out_prob = outs[0], outs[1]
 
     if n_features <= 0 or n_classes <= 0:
@@ -177,8 +178,10 @@ def materialize_repo(
     shutil.copyfile(str(local), tmp)
     os.replace(tmp, dst)
 
-    base_cfg = build_config_pbtxt(str(model), str(in_name), str(out_prob), str(out_label), n_features, n_classes)
-    write_config_with_policy_atomic(model_dir, base_cfg=base_cfg, version=int(deploy_version))
+    # ✅ config.pbtxt는 버전 강제 없이 생성/유지
+    cfg_text = build_config_pbtxt(str(model), str(in_name), str(out_prob), str(out_label), n_features, n_classes)
+    os.makedirs(model_dir, exist_ok=True)
+    write_config_atomic(model_dir, cfg_text=cfg_text)
 
     return {
         "model": str(model),
@@ -192,6 +195,7 @@ def materialize_repo(
 
 
 def rebuild_config_for_version(model: str, version: int) -> str:
+    # ✅ version_policy를 쓰지 않으므로 "버전별 재생성"이 아니라 "고정 config 재생성"만 유지
     run_id = run_id_by_version(model, int(version))
     params = get_run_params(run_id)
 
@@ -199,7 +203,9 @@ def rebuild_config_for_version(model: str, version: int) -> str:
     n_classes = int(params.get("n_classes", "0") or "0")
     in_name = params.get("onnx_input_name", "input")
 
-    outs = parse_output_names(params.get("onnx_output_names", ""))
+    outs_raw = params.get("onnx_output_names", "")
+    outs = [x.strip() for x in outs_raw.split(",") if x.strip()]
+
     out_label = "label"
     out_prob = "probabilities"
     for cand in outs:
@@ -211,5 +217,4 @@ def rebuild_config_for_version(model: str, version: int) -> str:
     if n_features <= 0 or n_classes <= 0:
         raise RuntimeError(f"[config] invalid n_features/n_classes: {n_features}/{n_classes}")
 
-    base = build_config_pbtxt(model, str(in_name), str(out_prob), str(out_label), n_features, n_classes)
-    return set_version_policy_specific(base, int(version))
+    return build_config_pbtxt(model, str(in_name), str(out_prob), str(out_label), n_features, n_classes)
