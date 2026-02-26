@@ -8,7 +8,9 @@ import mlflow
 from airflow.models import Variable
 from mlflow.tracking import MlflowClient
 
-# ---- Key SSOT (면접/운영 설명용 고정) ----
+# -----------------------
+# Key SSOT (면접/운영 설명용 고정)
+# -----------------------
 K_MLFLOW_TRACKING_URI = "MLFLOW_TRACKING_URI"
 
 K_FASTAPI_BASE_URL_ENV = "FASTAPI_BASE_URL"
@@ -18,6 +20,13 @@ K_RELOAD_TOKEN_ENV = "RELOAD_SECRET_TOKEN"
 K_RELOAD_TOKEN_VAR = "reload_token"
 
 K_EXPERIMENT_NAME = "experiment_name"
+
+# -----------------------
+# Timeout SSOT
+# -----------------------
+K_FASTAPI_RELOAD_TIMEOUT_ENV = "FASTAPI_RELOAD_TIMEOUT"
+K_FASTAPI_RELOAD_TIMEOUT_VAR = "fastapi_reload_timeout"
+DEFAULT_FASTAPI_RELOAD_TIMEOUT = 10
 
 
 def _non_empty(v: Any) -> Optional[str]:
@@ -43,9 +52,8 @@ def cfg(key: str, default: Any = None, *, required: bool = False) -> Any:
         return v
 
     try:
-        # default_var는 문자열로 들어가므로, default가 None이면 "없음"으로 간주
         if default is None:
-            v = Variable.get(key)  # 없으면 예외
+            v = Variable.get(key)
         else:
             v = Variable.get(key, default_var=str(default))
         v = _non_empty(v)
@@ -57,6 +65,16 @@ def cfg(key: str, default: Any = None, *, required: bool = False) -> Any:
     if required:
         raise RuntimeError(f"[Config] missing required key: {key}")
     return default
+
+
+def cfg_int(key: str, default: int, *, required: bool = False) -> int:
+    raw = cfg(key, default, required=required)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        if required:
+            raise RuntimeError(f"[Config] invalid int key={key} value={raw!r}")
+        return int(default)
 
 
 def get_tracking_uri() -> str:
@@ -73,7 +91,7 @@ def get_fastapi_base_url() -> str:
     """
     ✅ FastAPI base url precedence:
       1) env FASTAPI_BASE_URL
-      2) Airflow Variable fastapi_base_url (SSOT)
+      2) Airflow Variable fastapi_base_url
     """
     base = cfg(K_FASTAPI_BASE_URL_ENV, None, required=False)
     if base:
@@ -107,3 +125,11 @@ def get_reload_token() -> str:
 
 def get_experiment_name() -> str:
     return str(cfg(K_EXPERIMENT_NAME, required=True))
+
+
+# -----------------------
+# Exported SSOT constants
+# -----------------------
+T_FASTAPI_RELOAD = cfg_int(K_FASTAPI_RELOAD_TIMEOUT_ENV, DEFAULT_FASTAPI_RELOAD_TIMEOUT, required=False)
+# env가 없으면 Variable도 허용(실습/운영 유연성)
+T_FASTAPI_RELOAD = cfg_int(K_FASTAPI_RELOAD_TIMEOUT_VAR, T_FASTAPI_RELOAD, required=False)

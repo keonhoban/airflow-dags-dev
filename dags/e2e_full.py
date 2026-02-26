@@ -23,8 +23,10 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=2),
 }
 
-DAG_KWARGS = dict(
-    dag_id="e2e_full",
+DAG_ID = "e2e_full"
+
+with DAG(
+    dag_id=DAG_ID,
     default_args=DEFAULT_ARGS,
     schedule=None,
     catchup=False,
@@ -32,14 +34,11 @@ DAG_KWARGS = dict(
     tags=["e2e", "mlops", "triton", "mlflow"],
     on_failure_callback=alert_slack,
     dagrun_timeout=timedelta(minutes=30),
-)
+) as dag:
 
+    def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
+        return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
 
-def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
-    return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
-
-
-with DAG(**DAG_KWARGS) as dag:
     # 1) Data pipeline
     with TaskGroup(group_id="dp") as dp:
         extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
@@ -56,13 +55,13 @@ with DAG(**DAG_KWARGS) as dag:
 
     branch = BranchPythonOperator(
         task_id="check_result",
-        python_callable=p.check_result,  # -> register_model_task OR shadow_start
+        python_callable=p.branch_by_accuracy,  # -> register_model_task OR shadow_start
     )
 
-    # 3) Promotion path
     promotion_start = EmptyOperator(task_id="promotion_start")
     shadow_start = EmptyOperator(task_id="shadow_start")
 
+    # 3) Promotion path
     register = mk_py("register_model_task", p.register_model_task)
 
     check_model_ready = PythonSensor(
@@ -73,9 +72,10 @@ with DAG(**DAG_KWARGS) as dag:
         mode="reschedule",
     )
 
+    # train skipped / below threshold 알림 (shadow_start 경로)
     notify_failure = mk_py(
         "notify_failure",
-        p.notify_failure,
+        p.notify_shadow_reason,
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
@@ -98,10 +98,13 @@ with DAG(**DAG_KWARGS) as dag:
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
+    # deploy/commit 실패 시 최소 롤백
     rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
 
     # 5) Promotion-only
     commit_current = mk_py("commit_current", p.commit_current)
+
+    # ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음(모델 repo 되돌림은 위험)
     fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
 
     # Dependencies
@@ -115,8 +118,10 @@ with DAG(**DAG_KWARGS) as dag:
 
     deploy >> commit_current >> fastapi_reload
 
+    # rollback policy
     [deploy, commit_current] >> rollback_minimal
 
+    # summarize (always)
     store_features >> summarize_run
     fastapi_reload >> summarize_run
     rollback_minimal >> summarize_run
