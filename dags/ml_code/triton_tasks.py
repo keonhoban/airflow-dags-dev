@@ -239,36 +239,65 @@ def commit_current(ti, **_) -> None:
 
 def rollback_minimal(ti, **_) -> None:
     """
-    실패 시 최소 롤백:
-    - promotion: snapshot_current의 prev_current로 current.json 복원 + 실패 버전 디렉토리 격리(.failed_*)
-    - shadow: current.json은 원래 건드리지 않았으므로, 실패 버전 디렉토리만 격리
+    실패 시 최소 롤백 (✅ 절대 죽지 않는 best-effort):
+
+    - promotion:
+        - snapshot_current의 prev_current로 current.json 복원 시도
+        - 실패 버전 디렉토리 격리(.failed_*)
+    - shadow:
+        - current.json을 건드리지 않았으므로 실패 버전 디렉토리만 격리
     - 마지막에 unload/load로 Triton repository를 원상 복구 시도
+
+    NOTE:
+      materialize 단계 자체가 실패하면 XCom(model 등)이 없을 수 있습니다.
+      이 경우 rollback은 "가능한 만큼만" 하고 조용히 종료해야 합니다.
     """
-    model = _require_xcom(
-        ti,
-        key=K_MODEL,
-        task_ids=_mat_task_ids(),
-        hint="deploy.materialize_repo가 선행되어야 합니다.",
-    )
+    # ✅ 여기서는 require 절대 금지: 롤백이 롤백을 부르는 사고를 막는다
+    model = _xcom_pull_any(ti, key=K_MODEL, task_ids=_mat_task_ids())
     model_dir = _xcom_pull_any(ti, key=K_MODEL_DIR, task_ids=_mat_task_ids())
     deploy_v = _xcom_pull_any(ti, key=K_DEPLOY_VERSION, task_ids=_mat_task_ids())
     deploy_mode = _xcom_pull_any(ti, key=K_DEPLOY_MODE, task_ids=_mat_task_ids())
 
     prev = _xcom_pull_any(ti, key=K_PREV_CURRENT, task_ids=_snapshot_task_ids())
 
-    log.warning("[ROLLBACK] start model=%s deploy_version=%s mode=%s", model, deploy_v, deploy_mode)
-
     base_model = cfg("triton_model_name", required=True)
+    repo = cfg("triton_repo_base", "/models")
+    base_model_dir = os.path.join(str(repo), str(base_model))
+
+    if not model:
+        log.warning(
+            "[ROLLBACK] missing XCom(model). deploy_v=%s mode=%s -> fallback only (base_model=%s)",
+            str(deploy_v),
+            str(deploy_mode),
+            str(base_model),
+        )
+        # snapshot이 있으면 base_model current.json 복원만 시도
+        if prev is not None:
+            try:
+                atomic_write(os.path.join(base_model_dir, "current.json"), json.dumps(prev, indent=2))
+                log.warning("[ROLLBACK] restored current.json using snapshot (fallback)")
+            except Exception as e:
+                log.warning("[ROLLBACK] fallback restore failed: %s", e)
+        else:
+            log.warning("[ROLLBACK] no snapshot(prev_current) -> nothing to restore")
+        return
+
+    log.warning("[ROLLBACK] start model=%s deploy_version=%s mode=%s", model, deploy_v, deploy_mode)
 
     # promotion일 때만 current.json 복원
     if str(deploy_mode) != "shadow" and str(model) == str(base_model) and prev is not None and model_dir:
         path = os.path.join(str(model_dir), "current.json")
-        atomic_write(path, json.dumps(prev, indent=2))
-        log.warning("[ROLLBACK] restored current.json (promote)")
+        try:
+            atomic_write(path, json.dumps(prev, indent=2))
+            log.warning("[ROLLBACK] restored current.json (promote)")
+        except Exception as e:
+            log.warning("[ROLLBACK] failed to restore current.json: %s", e)
 
     # 실패 버전 디렉토리 격리(best-effort)
-    if deploy_v is not None and model_dir:
-        ver_dir = os.path.join(str(model_dir), str(deploy_v))
+    if deploy_v is not None:
+        # model_dir가 없으면 repo 기반으로 계산
+        md = str(model_dir) if model_dir else os.path.join(str(repo), str(model))
+        ver_dir = os.path.join(md, str(deploy_v))
         if os.path.isdir(ver_dir):
             failed_dir = ver_dir + f".failed_{utc_ts()}"
             try:
