@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Sequence
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from ml_code.config import cfg
-from mlops_lib.core.triton_config import atomic_write, write_or_update_config_policy
+from mlops_lib.core.triton_config import atomic_write
 from ml_code.triton_actions import (
     utc_ts,
     decide_deploy_target,
@@ -84,7 +84,7 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
 
     meta = materialize_repo(model=model, deploy_version=int(deploy_version), run_id=str(chosen_run_id))
 
-    # ✅ materialize_repo task에서 downstream이 쓰는 값들 전부 push
+    # ✅ downstream이 쓰는 값들 전부 push
     ti.xcom_push(key=K_MODEL, value=meta[K_MODEL])
     ti.xcom_push(key=K_MODEL_DIR, value=meta[K_MODEL_DIR])
     ti.xcom_push(key=K_DEPLOY_VERSION, value=int(meta[K_DEPLOY_VERSION]))
@@ -129,6 +129,11 @@ def triton_infer_smoke_task(ti, **_) -> None:
 
 
 def commit_current(ti, **_) -> None:
+    """
+    ✅ SSOT는 current.json 하나로만 관리합니다.
+    - version_policy는 사용하지 않습니다.
+    - Triton은 /models/<model>/<version>/model.onnx 존재 여부로만 버전을 인식합니다.
+    """
     model = _require_xcom(ti, key=K_MODEL, task_ids=T_MAT, hint="Check TaskGroup prefix deploy.*")
     base_model = cfg("triton_model_name", required=True)
 
@@ -156,7 +161,6 @@ def commit_current(ti, **_) -> None:
     path = os.path.join(str(model_dir), "current.json")
     atomic_write(path, json.dumps(payload, indent=2))
 
-    write_or_update_config_policy(str(model_dir), version=deploy_version)
     log.info("[commit] OK version=%s path=%s", deploy_version, path)
 
 
