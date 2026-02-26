@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json, io
+import io
+import json
 from datetime import datetime, timezone, timedelta
+from typing import Any, Optional, Sequence
+
+import pandas as pd
 from airflow.utils.log.logging_mixin import LoggingMixin
 from jinja2 import Template
-import pandas as pd
 
 from .s3 import get_s3_client, parse_s3_uri
 
@@ -26,16 +29,29 @@ def _read_local_text(path: str) -> str:
         return f.read()
 
 
+def _xcom_pull_any(ti, *, key: str, task_ids: Sequence[str]) -> Optional[Any]:
+    """TaskGroup(dp.) 유무에 상관없이 XCom을 안전하게 pull."""
+    for tid in task_ids:
+        v = ti.xcom_pull(key=key, task_ids=tid)
+        if v is not None:
+            return v
+    return None
+
+
 def store_features(feature_base: str, pipeline_name: str, feature_set: str, metadata_tpl_path: str, ti) -> None:
     s3 = get_s3_client()
 
-    schema = ti.xcom_pull(key="fs_schema", task_ids="build_features")
-    schema_hash = ti.xcom_pull(key="fs_schema_hash", task_ids="build_features")
-    features_csv = ti.xcom_pull(key="fs_features_csv", task_ids="build_features")
-    rows = ti.xcom_pull(key="fs_feature_rows", task_ids="build_features")
-    source_raw = ti.xcom_pull(key="dp_raw_path", task_ids="build_features") or ti.xcom_pull(
-        key="dp_raw_path", task_ids="extract_raw_data"
-    )
+    # TaskGroup 적용 시 task_id prefix가 dp.로 붙음
+    BUILD_TASKS = ("dp.build_features", "build_features")
+    EXTRACT_TASKS = ("dp.extract_raw_data", "extract_raw_data")
+
+    schema = _xcom_pull_any(ti, key="fs_schema", task_ids=BUILD_TASKS)
+    schema_hash = _xcom_pull_any(ti, key="fs_schema_hash", task_ids=BUILD_TASKS)
+    features_csv = _xcom_pull_any(ti, key="fs_features_csv", task_ids=BUILD_TASKS)
+    rows = _xcom_pull_any(ti, key="fs_feature_rows", task_ids=BUILD_TASKS)
+
+    # dp_raw_path는 extract 단계에서 나오는 게 정상이므로 extract에서 우선 pull
+    source_raw = _xcom_pull_any(ti, key="dp_raw_path", task_ids=EXTRACT_TASKS)
 
     if not features_csv:
         raise ValueError("features_csv missing")
@@ -79,7 +95,12 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
 
     def _put(prefix: str):
         s3.put_object(Bucket=bkt, Key=f"{prefix}features.csv", Body=feat_csv_bytes, ContentType="text/csv")
-        s3.put_object(Bucket=bkt, Key=f"{prefix}features.parquet", Body=parquet_bytes, ContentType="application/octet-stream")
+        s3.put_object(
+            Bucket=bkt,
+            Key=f"{prefix}features.parquet",
+            Body=parquet_bytes,
+            ContentType="application/octet-stream",
+        )
         s3.put_object(Bucket=bkt, Key=f"{prefix}schema.json", Body=schema_bytes, ContentType="application/json")
         s3.put_object(Bucket=bkt, Key=f"{prefix}metadata.json", Body=meta_bytes, ContentType="application/json")
 
@@ -92,4 +113,3 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     ti.xcom_push(key="fs_feature_uri", value=feature_uri)
 
     logger.info("[FS] store_features OK version=%s rows=%s uri=%s", ver, rows, feature_uri)
-
