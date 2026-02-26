@@ -22,12 +22,13 @@ from ml_code.register_model import register_model
 from ml_code.sensor_model_ready import check_model_ready
 
 # ✅ Triton은 "tasks" 계층만 바라보게 고정 (deploy/actions 혼재 방지)
+# ✅ 이름 충돌 방지: *impl 로 import (actions의 triton_load/ready/infer와 절대 충돌 금지)
 from ml_code.triton_tasks import (
     snapshot_current as triton_snapshot_current,
     materialize as triton_materialize,
-    triton_load as triton_load,
-    triton_ready as triton_ready,
-    triton_infer_smoke as triton_infer_smoke,
+    triton_load_task as triton_load_task_impl,
+    triton_ready_task as triton_ready_task_impl,
+    triton_infer_smoke_task as triton_infer_smoke_task_impl,
     commit_current as triton_commit_current,
     rollback_minimal as triton_rollback_minimal,
     # ✅ materialize()가 push하는 XCom key SSOT를 직접 사용 (암묵 문자열 일치 제거)
@@ -333,15 +334,15 @@ def triton_materialize_task(**context: Any) -> None:
 
 
 def triton_load_task(**context: Any) -> None:
-    return triton_load(ti=context["ti"])
+    return triton_load_task_impl(ti=context["ti"])
 
 
 def triton_ready_task(**context: Any) -> None:
-    return triton_ready(ti=context["ti"])
+    return triton_ready_task_impl(ti=context["ti"])
 
 
 def triton_infer_smoke_task(**context: Any) -> None:
-    return triton_infer_smoke(ti=context["ti"])
+    return triton_infer_smoke_task_impl(ti=context["ti"])
 
 
 def commit_current(**context: Any) -> None:
