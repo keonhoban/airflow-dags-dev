@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -181,6 +182,11 @@ def _validate_onnx_file(onnx_path: str, *, warn_bytes: int = 10_000) -> None:
 
 
 def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
+    """
+    ✅ Artifact contract (SSOT):
+      - MLflow에 반드시 'onnx/model.onnx'로 저장한다.
+      - tmp 파일은 run_id로 분리하되 업로드 파일명은 model.onnx로 고정.
+    """
     initial_type = [("input", FloatTensorType([None, n_features]))]
     onnx_model = convert_sklearn(
         clf,
@@ -196,7 +202,7 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
         mlflow.log_param("onnx_output_names", ",".join(out_names))
         logger.info("[ONNX] io names input=%s output=%s", in_name, out_names)
 
-        # 의미 힌트도 남겨서 downstream(Triton config) 설명 가능하게
+        # (선택) 의미 힌트도 남겨 downstream(Triton config) 설명 가능하게
         if out_names:
             prob = next((n for n in out_names if "prob" in n.lower()), out_names[0])
             label = next((n for n in out_names if "label" in n.lower()), out_names[-1])
@@ -205,20 +211,24 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
     except Exception as e:
         logger.warning("[ONNX] failed to extract io names: %s", e)
 
-    # ✅ 병렬/재시도 대비: run_id 기반 임시 파일
-    onnx_path = f"/tmp/model_{run_id}.onnx"
+    # ✅ 병렬/재시도 대비: run_id별 tmp dir + 업로드 파일명은 model.onnx로 고정
+    tmp_dir = os.path.join(tempfile.gettempdir(), f"onnx_{run_id}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    onnx_path = os.path.join(tmp_dir, "model.onnx")
+
     with open(onnx_path, "wb") as f:
         f.write(onnx_model.SerializeToString())
 
-    # ✅ 핵심: log_artifact 전에 검증 통과 못 하면 FAIL
     _validate_onnx_file(onnx_path)
 
+    # ✅ 핵심: onnx/model.onnx로 올라감
     mlflow.log_artifact(onnx_path, artifact_path="onnx")
     logger.info("[ONNX] logged: onnx/model.onnx (tmp=%s)", onnx_path)
 
     # best-effort cleanup
     try:
         os.remove(onnx_path)
+        os.rmdir(tmp_dir)
     except Exception:
         pass
 
@@ -263,9 +273,13 @@ def train_model(
     )
 
     try:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=42
+        )
     except Exception:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
 
     with mlflow.start_run() as run:
         run_id = run.info.run_id
