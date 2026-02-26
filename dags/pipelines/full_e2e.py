@@ -10,11 +10,11 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from utils.slack_alerts import notify_info, notify_success, notify_skip
 
 from mlops_lib.dp.tasks import (
-    task_extract_raw_data as dp_extract,
-    task_validate_data as dp_validate,
-    task_build_features as dp_build,
-    task_store_features as dp_store,
-    task_summarize_run as dp_summary,
+    task_extract_raw_data as _dp_extract,
+    task_validate_data as _dp_validate,
+    task_build_features as _dp_build,
+    task_store_features as _dp_store,
+    task_summarize_run as _dp_summary,
 )
 
 from ml_code.train_model import train_model, TrainSkippableError
@@ -80,30 +80,37 @@ class Settings:
         model_name = (_v("triton_model_name", _v("model_name", "best_model")) or "best_model").strip()
         alias = (_v("mlflow_alias", "A") or "A").strip()
 
-        return cls(env=env, accuracy_threshold=th, logreg_c=c, logreg_max_iter=it, model_name=model_name, alias=alias)
+        return cls(
+            env=env,
+            accuracy_threshold=th,
+            logreg_c=c,
+            logreg_max_iter=it,
+            model_name=model_name,
+            alias=alias,
+        )
 
 
 # -----------------------
-# Data pipeline wrappers (TaskGroup에서 바로 부름)
+# Data pipeline wrappers (TaskGroup에서 호출)
 # -----------------------
 def dp_extract(**context: Any):
-    return dp_extract(**context)
+    return _dp_extract(**context)
 
 
 def dp_validate(**context: Any):
-    return dp_validate(**context)
+    return _dp_validate(**context)
 
 
 def dp_build(**context: Any):
-    return dp_build(**context)
+    return _dp_build(**context)
 
 
 def dp_store(**context: Any):
-    return dp_store(**context)
+    return _dp_store(**context)
 
 
 def dp_summary(**context: Any):
-    return dp_summary(**context)
+    return _dp_summary(**context)
 
 
 # -----------------------
@@ -224,13 +231,23 @@ def triton_materialize_task(**context: Any) -> None:
     version = ti.xcom_pull(task_ids="register_model_task", key="version")
 
     if version:
-        notify_info("Triton deploy: promotion path (alias->MLflow version)", env=s.env, alias=str(al), version=str(version))
+        notify_info(
+            "Triton deploy: promotion path (alias->MLflow version)",
+            env=s.env,
+            alias=str(al),
+            version=str(version),
+        )
         return triton_materialize(ti=ti, alias=str(al), shadow=False)
 
     if not run_id:
         raise ValueError("Shadow deploy 불가: run_id XCom 누락 (train_and_evaluate 확인 필요)")
 
-    notify_info("Triton deploy: shadow path (run_id->timestamp)", env=s.env, alias=str(al), run_id=str(run_id))
+    notify_info(
+        "Triton deploy: shadow path (run_id->timestamp)",
+        env=s.env,
+        alias=str(al),
+        run_id=str(run_id),
+    )
     return triton_materialize(ti=ti, alias=str(al), run_id=str(run_id), shadow=True)
 
 
@@ -271,11 +288,21 @@ def fastapi_reload_task(**context: Any) -> None:
         if not run_id:
             raise ValueError("FastAPI shadow reload 불가: run_id XCom 누락 (materialize_repo 확인 필요)")
         trigger_reload(str(al), run_id=str(run_id))
-        notify_success("FastAPI reload completed (shadow/run_id)", env=s.env, alias=str(al), run_id=str(run_id))
+        notify_success(
+            "FastAPI reload completed (shadow/run_id)",
+            env=s.env,
+            alias=str(al),
+            run_id=str(run_id),
+        )
         return
 
     if deploy_version is None:
         raise ValueError("FastAPI promotion reload 불가: deploy_version XCom 누락 (materialize_repo 확인 필요)")
 
     trigger_reload(str(al), deploy_version=int(deploy_version))
-    notify_success("FastAPI reload completed (promotion/deploy_version)", env=s.env, alias=str(al), deploy_version=str(deploy_version))
+    notify_success(
+        "FastAPI reload completed (promotion/deploy_version)",
+        env=s.env,
+        alias=str(al),
+        deploy_version=str(deploy_version),
+    )
