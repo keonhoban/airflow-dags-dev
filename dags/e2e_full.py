@@ -40,6 +40,7 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=E2E_RETRY_DELAY_MIN),
 }
 
+
 with DAG(
     dag_id=DAG_ID_E2E_FULL,
     default_args=DEFAULT_ARGS,
@@ -52,9 +53,15 @@ with DAG(
 ) as dag:
 
     def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
-        return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
+        return PythonOperator(
+            task_id=task_id,
+            python_callable=fn,
+            trigger_rule=trigger_rule,
+        )
 
-    # 1) Data pipeline
+    # =========================================================
+    # 1) Data Pipeline
+    # =========================================================
     with TaskGroup(group_id=TG_DP) as dp:
         extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
         validate_data = mk_py("validate_data", p.dp_validate)
@@ -65,7 +72,9 @@ with DAG(
 
     summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
+    # =========================================================
     # 2) Train / Branch
+    # =========================================================
     train = mk_py("train_and_evaluate", p.train_and_evaluate)
 
     branch = BranchPythonOperator(
@@ -76,7 +85,9 @@ with DAG(
     promotion_start = EmptyOperator(task_id="promotion_start")
     shadow_start = EmptyOperator(task_id="shadow_start")
 
+    # =========================================================
     # 3) Promotion path
+    # =========================================================
     register = mk_py("register_model_task", p.register_model_task)
 
     check_model_ready = PythonSensor(
@@ -87,14 +98,15 @@ with DAG(
         mode=MODEL_READY_MODE,
     )
 
-    # train skipped / below threshold 알림 (shadow_start 경로)
     notify_failure = mk_py(
         "notify_failure",
         p.notify_shadow_reason,
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
+    # =========================================================
     # 4) Deploy chain
+    # =========================================================
     with TaskGroup(group_id=TG_DEPLOY) as deploy:
         snapshot_current = mk_py(
             "snapshot_current",
@@ -113,19 +125,33 @@ with DAG(
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    # deploy/commit/observe 실패 시 최소 롤백
-    rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
-
-    # ✅ FastAPI reload 실패는 자동 롤백하지 않음(정책 유지)
-    fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
-
-    # ✅ 배포 후 관측(임계치 초과 시 실패 -> rollback 트리거)
-    observe_metrics = mk_py("observe_metrics", p.observe_post_deploy_metrics)
-
-    # 5) commit (promotion-only 의미지만, 파이프라인 SSOT 관점에서 공통 체인으로 둠)
+    # =========================================================
+    # 5) Commit (SSOT 확정 단계)
+    # =========================================================
     commit_current = mk_py("commit_current", p.commit_current)
 
+    # =========================================================
+    # 6) FastAPI reload (정책: 실패 시 자동 rollback 안함)
+    # =========================================================
+    fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
+
+    # =========================================================
+    # 7) Post-deploy Observability (Auto Rollback Trigger)
+    # =========================================================
+    observe_metrics = mk_py("observe_metrics", p.observe_post_deploy_metrics)
+
+    # =========================================================
+    # 8) Rollback (deploy/commit/observe 실패 시)
+    # =========================================================
+    rollback_minimal = mk_py(
+        "rollback_minimal",
+        p.triton_rollback_task,
+        trigger_rule=TriggerRule.ONE_FAILED,
+    )
+
+    # =========================================================
     # Dependencies
+    # =========================================================
     dp >> train >> branch
 
     branch >> register >> promotion_start
@@ -134,11 +160,12 @@ with DAG(
     promotion_start >> check_model_ready >> deploy
     shadow_start >> deploy
 
-    # ✅ deploy 후: reload -> observe -> commit
-    deploy >> fastapi_reload >> observe_metrics >> commit_current
+    # ✅ 운영형 순서:
+    # deploy → commit → reload → observe
+    deploy >> commit_current >> fastapi_reload >> observe_metrics
 
-    # rollback policy (fastapi_reload는 제외)
-    [deploy, observe_metrics, commit_current] >> rollback_minimal
+    # rollback policy (reload는 제외)
+    [deploy, commit_current, observe_metrics] >> rollback_minimal
 
     # summarize (always)
     store_features >> summarize_run
