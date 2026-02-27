@@ -11,21 +11,16 @@ import mlflow
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from ml_code.config import cfg, get_mlflow_client, get_tracking_uri
-from mlops_lib.core.triton_config import (
-    build_config_pbtxt,
-    write_config_atomic,
-)
+from mlops_lib.core.triton_config import build_config_pbtxt, write_config_atomic
 from mlops_lib.infra.http import request_ok, request_json
+from mlops_lib.core.policy import (
+    T_TRITON_UNLOAD,
+    T_TRITON_LOAD,
+    T_TRITON_READY,
+    T_TRITON_INFER,
+)
 
 log = LoggingMixin().log
-
-# -----------------------
-# SSOT: timeouts
-# -----------------------
-T_TRITON_UNLOAD = 10
-T_TRITON_LOAD = 10
-T_TRITON_READY = 5
-T_TRITON_INFER = 10
 
 
 def utc_ts() -> str:
@@ -37,10 +32,6 @@ def now_ts() -> str:
 
 
 def _ensure_tracking_uri() -> None:
-    """
-    ✅ SSOT: 모든 MLflow 작업 전에 tracking uri를 보장합니다.
-    - 여러 번 호출되어도 안전(idempotent)해야 합니다.
-    """
     uri = get_tracking_uri()
     try:
         mlflow.set_tracking_uri(uri)
@@ -50,15 +41,6 @@ def _ensure_tracking_uri() -> None:
 
 @lru_cache(maxsize=1)
 def build_triton_http_url() -> str:
-    """
-    우선순위:
-      1) TRITON_HTTP_URL (full)
-      2) service/namespace/port 조합
-
-    ✅ 제출/운영 기준:
-    - 런타임 중 URL이 바뀌는 것은 오히려 위험(관찰/재현 불가)
-    - 배포로 변경 반영되도록 캐시(프로세스 단위) 고정
-    """
     full = cfg("TRITON_HTTP_URL", None)
     if full:
         return str(full)
@@ -97,7 +79,6 @@ def triton_unload(model: str) -> None:
     try:
         request_ok("POST", f"{triton}/v2/repository/models/{model}/unload", timeout=T_TRITON_UNLOAD)
     except Exception as e:
-        # unload 실패는 자주 발생 가능(로드 전 등). best-effort로 무시
         log.warning("[unload] ignore model=%s err=%s", model, e)
 
 
@@ -148,10 +129,6 @@ def _parse_int(params: Dict[str, str], key: str, default: int = 0) -> int:
 
 
 def _pick_outputs(outs_raw: str) -> Tuple[str, str]:
-    """
-    onnx_output_names="label,probabilities" 같은 형태를 받아
-    (out_prob, out_label)를 결정합니다.
-    """
     outs = [x.strip() for x in (outs_raw or "").split(",") if x.strip()]
 
     out_label = "label"
@@ -160,7 +137,6 @@ def _pick_outputs(outs_raw: str) -> Tuple[str, str]:
     if not outs:
         return out_prob, out_label
 
-    # 힌트 기반 우선 선택
     for cand in outs:
         if "label" in cand.lower():
             out_label = cand
@@ -170,7 +146,6 @@ def _pick_outputs(outs_raw: str) -> Tuple[str, str]:
             out_prob = cand
             break
 
-    # 2개 이상인데 힌트 매칭이 이상하면 앞의 2개를 사용
     if len(outs) >= 2 and (out_label not in outs or out_prob not in outs):
         out_label, out_prob = outs[0], outs[1]
 
@@ -200,9 +175,6 @@ def decide_deploy_target(
     run_id: Optional[str],
     shadow: bool,
 ) -> Tuple[str, int, str, str, str]:
-    """
-    Returns: (model, deploy_version, chosen_run_id, used_alias, mode)
-    """
     shadow_model = cfg("triton_model_name_shadow", f"{base_model}_shadow")
 
     if shadow:
@@ -216,16 +188,7 @@ def decide_deploy_target(
     return str(base_model), int(deploy_version), str(chosen_run_id), str(used_alias), "promote"
 
 
-def materialize_repo(
-    *,
-    model: str,
-    deploy_version: int,
-    run_id: str,
-) -> Dict[str, Any]:
-    """
-    - 모델 artifact 다운로드 → /models/<model>/<deploy_version>/model.onnx
-    - ✅ config.pbtxt는 version_policy 없이 '고정 형태'로 생성/유지
-    """
+def materialize_repo(*, model: str, deploy_version: int, run_id: str) -> Dict[str, Any]:
     repo = cfg("triton_repo_base", "/models")
     onnx_rel = cfg("triton_onnx_artifact_path", "onnx/model.onnx")
 
@@ -251,7 +214,6 @@ def materialize_repo(
     dst = os.path.join(ver_dir, "model.onnx")
     _write_model_onnx(dst, local, model=str(model), deploy_version=int(deploy_version), run_id=str(run_id))
 
-    # ✅ config.pbtxt는 버전 강제 없이 생성/유지
     cfg_text = build_config_pbtxt(str(model), str(in_name), str(out_prob), str(out_label), n_features, n_classes)
     os.makedirs(model_dir, exist_ok=True)
     write_config_atomic(model_dir, cfg_text=cfg_text)
@@ -268,10 +230,6 @@ def materialize_repo(
 
 
 def rebuild_config_for_version(model: str, version: int) -> str:
-    """
-    ✅ version_policy를 쓰지 않으므로 "버전별 policy 변경"이 아니라
-    run params 기반으로 config.pbtxt를 재생성하는 기능만 유지합니다.
-    """
     run_id = run_id_by_version(model, int(version))
     params = get_run_params(run_id)
 

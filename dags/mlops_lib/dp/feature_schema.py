@@ -1,6 +1,12 @@
 from __future__ import annotations
 import json, hashlib
 
+# -----------------------------
+# Training data contract (SSOT)
+# -----------------------------
+
+FEATURE_COLS = ["f_total_events_7d", "f_avg_session_sec_7d", "f_last_event_age_sec"]
+LABEL_COL = "label"
 
 def read_local_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:

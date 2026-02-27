@@ -15,32 +15,66 @@ from airflow.utils.trigger_rule import TriggerRule
 from pipelines import full_e2e as p
 from utils.slack_alerts import alert_slack
 
+from mlops_lib.core.ids import (
+    DAG_ID_E2E_FULL,
+    TG_DP,
+    TG_DEPLOY,
+    # tasks
+    T_DP_EXTRACT_TASK_ID,
+    T_DP_VALIDATE_TASK_ID,
+    T_DP_BUILD_TASK_ID,
+    T_DP_STORE_TASK_ID,
+    SUMMARIZE_TASK_ID,
+    TRAIN_TASK_ID,
+    BRANCH_TASK_ID,
+    REGISTER_TASK_ID,
+    PROMOTION_START_TASK_ID,
+    SHADOW_START_TASK_ID,
+    NOTIFY_FAILURE_TASK_ID,
+    SENSOR_MODEL_READY_TASK_ID,
+    COMMIT_CURRENT_TASK_ID,
+    FASTAPI_RELOAD_TASK_ID,
+    ROLLBACK_MINIMAL_TASK_ID,
+)
+
+# NOTE: e2e_full.py에서 TaskGroup 내부 task_id는 TG로 자동 prefix됩니다.
+# ids.py에는 "dp.store_features" 같은 full-id도 있지만, DAG에서는 task_id는 "store_features"로 만들어야 합니다.
+
+from mlops_lib.core.policy import (
+    E2E_START_DATE_YMD,
+    E2E_RETRIES,
+    E2E_RETRY_DELAY_MIN,
+    E2E_MAX_ACTIVE_RUNS,
+    E2E_DAGRUN_TIMEOUT_MIN,
+    MODEL_READY_POKE_INTERVAL_SEC,
+    MODEL_READY_TIMEOUT_SEC,
+    MODEL_READY_MODE,
+)
+
 kst = timezone("Asia/Seoul")
 
 DEFAULT_ARGS = {
-    "start_date": datetime(2025, 1, 1, tzinfo=kst),
-    "retries": 1,
-    "retry_delay": timedelta(minutes=2),
+    "start_date": datetime(*E2E_START_DATE_YMD, tzinfo=kst),
+    "retries": E2E_RETRIES,
+    "retry_delay": timedelta(minutes=E2E_RETRY_DELAY_MIN),
 }
 
-DAG_ID = "e2e_full"
-
 with DAG(
-    dag_id=DAG_ID,
+    dag_id=DAG_ID_E2E_FULL,
     default_args=DEFAULT_ARGS,
     schedule=None,
     catchup=False,
-    max_active_runs=1,
+    max_active_runs=E2E_MAX_ACTIVE_RUNS,
     tags=["e2e", "mlops", "triton", "mlflow"],
     on_failure_callback=alert_slack,
-    dagrun_timeout=timedelta(minutes=30),
+    dagrun_timeout=timedelta(minutes=E2E_DAGRUN_TIMEOUT_MIN),
 ) as dag:
 
-    def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
+    def mk_py(task_id: str, fn, *, trigger_rule=TriggerRule.ALL_SUCCESS) -> PythonOperator:
         return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
 
     # 1) Data pipeline
-    with TaskGroup(group_id="dp") as dp:
+    with TaskGroup(group_id=TG_DP) as dp:
         extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
         validate_data = mk_py("validate_data", p.dp_validate)
         build_features = mk_py("build_features", p.dp_build)
@@ -48,39 +82,38 @@ with DAG(
 
         extract_raw_data >> validate_data >> build_features >> store_features
 
-    summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
+    summarize_run = mk_py(SUMMARIZE_TASK_ID, p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
     # 2) Train / Branch
-    train = mk_py("train_and_evaluate", p.train_and_evaluate)
+    train = mk_py(TRAIN_TASK_ID, p.train_and_evaluate)
 
     branch = BranchPythonOperator(
-        task_id="check_result",
+        task_id=BRANCH_TASK_ID,
         python_callable=p.branch_by_accuracy,  # -> register_model_task OR shadow_start
     )
 
-    promotion_start = EmptyOperator(task_id="promotion_start")
-    shadow_start = EmptyOperator(task_id="shadow_start")
+    promotion_start = EmptyOperator(task_id=PROMOTION_START_TASK_ID)
+    shadow_start = EmptyOperator(task_id=SHADOW_START_TASK_ID)
 
     # 3) Promotion path
-    register = mk_py("register_model_task", p.register_model_task)
+    register = mk_py(REGISTER_TASK_ID, p.register_model_task)
 
     check_model_ready = PythonSensor(
-        task_id="check_model_ready",
+        task_id=SENSOR_MODEL_READY_TASK_ID,
         python_callable=p.sensor_ready_func,
-        poke_interval=10,
-        timeout=180,
-        mode="reschedule",
+        poke_interval=MODEL_READY_POKE_INTERVAL_SEC,
+        timeout=MODEL_READY_TIMEOUT_SEC,
+        mode=MODEL_READY_MODE,
     )
 
-    # train skipped / below threshold 알림 (shadow_start 경로)
     notify_failure = mk_py(
-        "notify_failure",
+        NOTIFY_FAILURE_TASK_ID,
         p.notify_shadow_reason,
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     # 4) Deploy chain
-    with TaskGroup(group_id="deploy") as deploy:
+    with TaskGroup(group_id=TG_DEPLOY) as deploy:
         snapshot_current = mk_py(
             "snapshot_current",
             p.snapshot_current,
@@ -98,14 +131,11 @@ with DAG(
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    # deploy/commit 실패 시 최소 롤백
-    rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
+    rollback_minimal = mk_py(ROLLBACK_MINIMAL_TASK_ID, p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
 
     # 5) Promotion-only
-    commit_current = mk_py("commit_current", p.commit_current)
-
-    # ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음(모델 repo 되돌림은 위험)
-    fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
+    commit_current = mk_py(COMMIT_CURRENT_TASK_ID, p.commit_current)
+    fastapi_reload = mk_py(FASTAPI_RELOAD_TASK_ID, p.fastapi_reload_task)
 
     # Dependencies
     dp >> train >> branch

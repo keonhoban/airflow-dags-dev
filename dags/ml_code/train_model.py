@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import boto3
 import pandas as pd
@@ -23,7 +24,8 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
-from ml_code.config import get_tracking_uri, get_experiment_name
+from ml_code.config import get_tracking_uri, get_experiment_name, cfg
+from mlops_lib.dp.feature_schema import FEATURE_COLS, LABEL_COL
 
 logger = LoggingMixin().log
 
@@ -36,13 +38,6 @@ class TrainSkippableError(RuntimeError):
     pass
 
 
-# -----------------------
-# Data spec (SSOT)
-# -----------------------
-FEATURE_COLS: List[str] = ["f_total_events_7d", "f_avg_session_sec_7d", "f_last_event_age_sec"]
-LABEL_COL: str = "label"
-
-
 @dataclass(frozen=True)
 class TrainInput:
     feature_uri: str
@@ -52,9 +47,6 @@ class TrainInput:
     code_version: Optional[str] = None
 
 
-# -----------------------
-# SSOT: S3 client defaults (operational safety)
-# -----------------------
 _S3_CFG = Config(
     retries={"max_attempts": 5, "mode": "standard"},
     connect_timeout=3,
@@ -62,9 +54,6 @@ _S3_CFG = Config(
 )
 
 
-# -----------------------
-# MLflow SSOT
-# -----------------------
 def _ensure_tracking_uri() -> None:
     uri = get_tracking_uri()
     try:
@@ -73,9 +62,6 @@ def _ensure_tracking_uri() -> None:
         raise RuntimeError(f"[MLflow] set_tracking_uri failed uri={uri} err={e}") from e
 
 
-# -----------------------
-# S3 helpers
-# -----------------------
 def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     if not uri.startswith("s3://"):
         raise ValueError(f"Invalid s3 uri: {uri}")
@@ -87,14 +73,26 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
 def _read_parquet_from_s3(feature_uri: str, *, s3_client=None) -> pd.DataFrame:
     bkt, key = _parse_s3_uri(feature_uri)
     s3 = s3_client or boto3.client("s3", config=_S3_CFG)
+
     obj = s3.get_object(Bucket=bkt, Key=key)
+
+    # optional safety: skip too large parquet (policy is DAG-level)
+    max_bytes_raw = cfg("train_max_bytes", None)
+    if max_bytes_raw:
+        try:
+            max_bytes = int(str(max_bytes_raw))
+            size = int(obj.get("ContentLength") or 0)
+            if size > 0 and size > max_bytes:
+                raise TrainSkippableError(f"학습 스킵: feature parquet too large size={size} > max_bytes={max_bytes}")
+        except TrainSkippableError:
+            raise
+        except Exception:
+            pass
+
     data = obj["Body"].read()
     return pd.read_parquet(io.BytesIO(data))
 
 
-# -----------------------
-# Validation helpers
-# -----------------------
 def _require_columns(df: pd.DataFrame, cols: Iterable[str]) -> None:
     missing = [c for c in cols if c not in df.columns]
     if missing:
@@ -102,11 +100,6 @@ def _require_columns(df: pd.DataFrame, cols: Iterable[str]) -> None:
 
 
 def _validate_training_data(df: pd.DataFrame) -> pd.Series:
-    """
-    학습 가능 여부 검증.
-    - 여기서는 '왜 불가능한지'를 결정하고,
-    - 처리 정책(스킵/실패)은 상위(DAG)가 결정할 수 있게 예외로 표현합니다.
-    """
     _require_columns(df, FEATURE_COLS)
 
     if LABEL_COL not in df.columns:
@@ -127,19 +120,7 @@ def _validate_training_data(df: pd.DataFrame) -> pd.Series:
     return y
 
 
-# -----------------------
-# ONNX gate
-# -----------------------
 def _validate_onnx_file(onnx_path: str, *, warn_bytes: int = 10_000) -> None:
-    """
-    ✅ ONNX 무결성 게이트 (downstream(Triton) 보호)
-
-    - 파일 존재/0바이트 방지
-    - onnx.load() 가능해야 함
-    - onnx.checker.check_model() 통과해야 함
-    - graph 최소 sanity (node/input/output)
-    - 크기는 "실패 조건"이 아니라 "경고"로만 사용
-    """
     import onnx
 
     if not os.path.exists(onnx_path):
@@ -182,11 +163,6 @@ def _validate_onnx_file(onnx_path: str, *, warn_bytes: int = 10_000) -> None:
 
 
 def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
-    """
-    ✅ Artifact contract (SSOT):
-      - MLflow에 반드시 'onnx/model.onnx'로 저장한다.
-      - tmp 파일은 run_id로 분리하되 업로드 파일명은 model.onnx로 고정.
-    """
     initial_type = [("input", FloatTensorType([None, n_features]))]
     onnx_model = convert_sklearn(
         clf,
@@ -194,7 +170,6 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
         options={id(clf): {"zipmap": False}},
     )
 
-    # io names -> params
     try:
         in_name = onnx_model.graph.input[0].name
         out_names = [o.name for o in onnx_model.graph.output]
@@ -202,7 +177,6 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
         mlflow.log_param("onnx_output_names", ",".join(out_names))
         logger.info("[ONNX] io names input=%s output=%s", in_name, out_names)
 
-        # (선택) 의미 힌트도 남겨 downstream(Triton config) 설명 가능하게
         if out_names:
             prob = next((n for n in out_names if "prob" in n.lower()), out_names[0])
             label = next((n for n in out_names if "label" in n.lower()), out_names[-1])
@@ -211,7 +185,6 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
     except Exception as e:
         logger.warning("[ONNX] failed to extract io names: %s", e)
 
-    # ✅ 병렬/재시도 대비: run_id별 tmp dir + 업로드 파일명은 model.onnx로 고정
     tmp_dir = os.path.join(tempfile.gettempdir(), f"onnx_{run_id}")
     os.makedirs(tmp_dir, exist_ok=True)
     onnx_path = os.path.join(tmp_dir, "model.onnx")
@@ -221,21 +194,15 @@ def export_onnx_and_log_artifact(clf, *, n_features: int, run_id: str) -> None:
 
     _validate_onnx_file(onnx_path)
 
-    # ✅ 핵심: onnx/model.onnx로 올라감
     mlflow.log_artifact(onnx_path, artifact_path="onnx")
     logger.info("[ONNX] logged: onnx/model.onnx (tmp=%s)", onnx_path)
 
-    # best-effort cleanup
     try:
-        os.remove(onnx_path)
-        os.rmdir(tmp_dir)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     except Exception:
         pass
 
 
-# -----------------------
-# Main
-# -----------------------
 def train_model(
     C: float,
     max_iter: int,
@@ -246,21 +213,16 @@ def train_model(
     env: Optional[str] = None,
     code_version: Optional[str] = None,
 ) -> Tuple[float, str]:
-    """
-    Returns: (accuracy, run_id)
-    """
     if not feature_uri:
         raise ValueError("feature_uri is required")
 
     _ensure_tracking_uri()
-
-    # ✅ experiment 관리 단순화
     mlflow.set_experiment(get_experiment_name())
 
     df = _read_parquet_from_s3(feature_uri)
     y = _validate_training_data(df)
 
-    X = df[FEATURE_COLS]
+    X = df[list(FEATURE_COLS)]
     uniq = sorted(pd.Series(y).unique().tolist())
 
     logger.info(
@@ -273,18 +235,13 @@ def train_model(
     )
 
     try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
     except Exception:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     with mlflow.start_run() as run:
         run_id = run.info.run_id
 
-        # tags lineage
         if env:
             mlflow.set_tag("env", str(env))
         if fs_version:
@@ -302,7 +259,6 @@ def train_model(
         acc = accuracy_score(y_test, y_pred)
         f1m = f1_score(y_test, y_pred, average="macro")
 
-        # params
         mlflow.log_param("C", C)
         mlflow.log_param("max_iter", max_iter)
         mlflow.log_param("feature_cols", ",".join(FEATURE_COLS))
@@ -311,14 +267,10 @@ def train_model(
         mlflow.log_param("n_features", X.shape[1])
         mlflow.log_param("n_classes", len(uniq))
 
-        # metrics
         mlflow.log_metric("accuracy", float(acc))
         mlflow.log_metric("f1_macro", float(f1m))
 
-        # artifacts
         mlflow.sklearn.log_model(clf, "model")
-
-        # ✅ ONNX 검증 실패하면 run은 남더라도 artifact(onnx)는 안 올라가고 task는 fail
         export_onnx_and_log_artifact(clf, n_features=X.shape[1], run_id=str(run_id))
 
         logger.info("[TRAIN] acc=%.4f f1_macro=%.4f run_id=%s", acc, f1m, run_id)

@@ -3,12 +3,29 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from ml_code.config import cfg
 from mlops_lib.core.triton_config import atomic_write
+from mlops_lib.core.ids import (
+    # xcom keys
+    K_MODEL,
+    K_MODEL_DIR,
+    K_DEPLOY_VERSION,
+    K_RUN_ID,
+    K_ALIAS,
+    K_DEPLOY_MODE,
+    K_N_FEATURES,
+    K_N_CLASSES,
+    K_ONNX_INPUT_NAME,
+    K_PREV_CURRENT,
+    # task ids
+    TRITON_MAT_TASK_ID,
+    TRITON_SNAPSHOT_TASK_ID,
+)
+
 from ml_code.triton_actions import (
     utc_ts,
     decide_deploy_target,
@@ -23,34 +40,11 @@ from ml_code.triton_actions import (
 
 log = LoggingMixin().log
 
-
 # -----------------------
-# XCom keys (SSOT)
+# Legacy support (optional)
 # -----------------------
-K_MODEL = "model"
-K_MODEL_DIR = "model_dir"
-K_DEPLOY_VERSION = "deploy_version"
-K_RUN_ID = "run_id"
-K_ALIAS = "alias"
-K_DEPLOY_MODE = "deploy_mode"
-K_N_FEATURES = "n_features"
-K_N_CLASSES = "n_classes"
-K_ONNX_INPUT_NAME = "onnx_input_name"
-
-K_PREV_CURRENT = "prev_current"
-
-
-# -----------------------
-# Task IDs (SSOT)
-# 제출/운영 기준: DAG 구조를 고정하고 task_id도 고정하는 게 정답입니다.
-# - 기본: TaskGroup deploy 아래 task_id를 단일 사용
-# - 예외: 레거시/실험 DAG를 지원해야 하면 allow_legacy_task_ids=true로 후보 탐색
-# -----------------------
-MAT_TASK_ID = "deploy.materialize_repo"
-SNAPSHOT_TASK_ID = "deploy.snapshot_current"
-
-_LEGACY_MAT_TASK_IDS: Sequence[str] = ("deploy.materialize_repo", "materialize_repo")
-_LEGACY_SNAPSHOT_TASK_IDS: Sequence[str] = ("deploy.snapshot_current", "snapshot_current")
+_LEGACY_MAT_TASK_IDS: Sequence[str] = (TRITON_MAT_TASK_ID, "materialize_repo")
+_LEGACY_SNAPSHOT_TASK_IDS: Sequence[str] = (TRITON_SNAPSHOT_TASK_ID, "snapshot_current")
 
 
 def _allow_legacy_task_ids() -> bool:
@@ -62,11 +56,6 @@ def _task_id_candidates(primary: str, legacy: Sequence[str]) -> Sequence[str]:
 
 
 def _xcom_pull_any(ti, *, key: str, task_ids: Sequence[str]) -> Optional[Any]:
-    """
-    task_id 후보를 순회하며 XCom을 찾습니다.
-    - 제출/운영 기본값은 단일 task_id(SSOT) 사용
-    - 레거시 모드에서만 후보 탐색
-    """
     for tid in task_ids:
         v = ti.xcom_pull(task_ids=tid, key=key)
         if v is not None:
@@ -80,27 +69,23 @@ def _require_xcom(ti, *, key: str, task_ids: Sequence[str], hint: str) -> Any:
         raise RuntimeError(
             "XCom missing: "
             f"key='{key}' from task_ids={list(task_ids)}. "
-            f"Hint: {hint} (SSOT task_id={MAT_TASK_ID})"
+            f"Hint: {hint}"
         )
     return v
 
 
 def _mat_task_ids() -> Sequence[str]:
-    return _task_id_candidates(MAT_TASK_ID, _LEGACY_MAT_TASK_IDS)
+    return _task_id_candidates(TRITON_MAT_TASK_ID, _LEGACY_MAT_TASK_IDS)
 
 
 def _snapshot_task_ids() -> Sequence[str]:
-    return _task_id_candidates(SNAPSHOT_TASK_ID, _LEGACY_SNAPSHOT_TASK_IDS)
+    return _task_id_candidates(TRITON_SNAPSHOT_TASK_ID, _LEGACY_SNAPSHOT_TASK_IDS)
 
 
 # -----------------------
 # Tasks
 # -----------------------
 def snapshot_current(ti, **_) -> None:
-    """
-    current.json의 이전 상태를 snapshot으로 남겨두어,
-    promotion 실패 시 rollback_minimal에서 복구할 수 있게 합니다.
-    """
     base_model = cfg("triton_model_name", required=True)
     repo = cfg("triton_repo_base", "/models")
     model_dir = os.path.join(str(repo), str(base_model))
@@ -119,12 +104,6 @@ def snapshot_current(ti, **_) -> None:
 
 
 def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool = False, **_) -> None:
-    """
-    Triton model repo에 배포 대상(version directory / model.onnx / config.pbtxt)을 물리화(materialize)합니다.
-
-    - promotion: base_model(best_model) 아래에 version 생성
-    - shadow: shadow model 이름으로 timestamp version 생성(SSOT current.json은 건드리지 않음)
-    """
     base_model = cfg("triton_model_name", required=True)
 
     model, deploy_version, chosen_run_id, used_alias, mode = decide_deploy_target(
@@ -136,7 +115,6 @@ def materialize(ti, alias: str = "A", *, run_id: str | None = None, shadow: bool
 
     meta = materialize_repo(model=model, deploy_version=int(deploy_version), run_id=str(chosen_run_id))
 
-    # ✅ downstream이 쓰는 값들 전부 push (SSOT)
     ti.xcom_push(key=K_MODEL, value=meta[K_MODEL])
     ti.xcom_push(key=K_MODEL_DIR, value=meta[K_MODEL_DIR])
     ti.xcom_push(key=K_DEPLOY_VERSION, value=int(meta[K_DEPLOY_VERSION]))
@@ -164,7 +142,6 @@ def triton_load_task(ti, **_) -> None:
         task_ids=_mat_task_ids(),
         hint="materialize_repo는 deploy TaskGroup 아래 task_id='deploy.materialize_repo'가 표준입니다.",
     )
-    # 안전한 reload (unload -> load)
     triton_unload(str(model))
     triton_load(str(model))
 
@@ -188,18 +165,10 @@ def triton_infer_smoke_task(ti, **_) -> None:
     )
     n_features = int(_xcom_pull_any(ti, key=K_N_FEATURES, task_ids=_mat_task_ids()) or 0)
     in_name = _xcom_pull_any(ti, key=K_ONNX_INPUT_NAME, task_ids=_mat_task_ids()) or "input"
-
-    # smoke test는 "서빙이 살아있다"만 최소 보장 (정확도 검증은 train 단계 책임)
     _ = triton_infer_smoke(str(model), in_name=str(in_name), n_features=int(n_features))
 
 
 def commit_current(ti, **_) -> None:
-    """
-    ✅ SSOT: current.json (promotion에서만 갱신)
-
-    - promotion: base_model(best_model)의 active_version을 갱신 (서비스 트래픽 전환 기준)
-    - shadow: current.json을 건드리지 않음 (SSOT는 promotion만 관리)
-    """
     model = _require_xcom(
         ti,
         key=K_MODEL,
@@ -213,7 +182,6 @@ def commit_current(ti, **_) -> None:
         log.warning("[commit] skip current.json for shadow model=%s", model)
         return
 
-    # promotion은 base_model에만 허용
     if str(model) != str(base_model):
         raise RuntimeError(f"[commit] unexpected promote model={model} (base_model={base_model})")
 
@@ -238,21 +206,6 @@ def commit_current(ti, **_) -> None:
 
 
 def rollback_minimal(ti, **_) -> None:
-    """
-    실패 시 최소 롤백 (✅ 절대 죽지 않는 best-effort):
-
-    - promotion:
-        - snapshot_current의 prev_current로 current.json 복원 시도
-        - 실패 버전 디렉토리 격리(.failed_*)
-    - shadow:
-        - current.json을 건드리지 않았으므로 실패 버전 디렉토리만 격리
-    - 마지막에 unload/load로 Triton repository를 원상 복구 시도
-
-    NOTE:
-      materialize 단계 자체가 실패하면 XCom(model 등)이 없을 수 있습니다.
-      이 경우 rollback은 "가능한 만큼만" 하고 조용히 종료해야 합니다.
-    """
-    # ✅ 여기서는 require 절대 금지: 롤백이 롤백을 부르는 사고를 막는다
     model = _xcom_pull_any(ti, key=K_MODEL, task_ids=_mat_task_ids())
     model_dir = _xcom_pull_any(ti, key=K_MODEL_DIR, task_ids=_mat_task_ids())
     deploy_v = _xcom_pull_any(ti, key=K_DEPLOY_VERSION, task_ids=_mat_task_ids())
@@ -271,7 +224,6 @@ def rollback_minimal(ti, **_) -> None:
             str(deploy_mode),
             str(base_model),
         )
-        # snapshot이 있으면 base_model current.json 복원만 시도
         if prev is not None:
             try:
                 atomic_write(os.path.join(base_model_dir, "current.json"), json.dumps(prev, indent=2))
@@ -284,7 +236,6 @@ def rollback_minimal(ti, **_) -> None:
 
     log.warning("[ROLLBACK] start model=%s deploy_version=%s mode=%s", model, deploy_v, deploy_mode)
 
-    # promotion일 때만 current.json 복원
     if str(deploy_mode) != "shadow" and str(model) == str(base_model) and prev is not None and model_dir:
         path = os.path.join(str(model_dir), "current.json")
         try:
@@ -293,9 +244,7 @@ def rollback_minimal(ti, **_) -> None:
         except Exception as e:
             log.warning("[ROLLBACK] failed to restore current.json: %s", e)
 
-    # 실패 버전 디렉토리 격리(best-effort)
     if deploy_v is not None:
-        # model_dir가 없으면 repo 기반으로 계산
         md = str(model_dir) if model_dir else os.path.join(str(repo), str(model))
         ver_dir = os.path.join(md, str(deploy_v))
         if os.path.isdir(ver_dir):
@@ -306,7 +255,6 @@ def rollback_minimal(ti, **_) -> None:
             except Exception as e:
                 log.warning("[ROLLBACK] failed to move dir: %s -> %s err=%s", ver_dir, failed_dir, e)
 
-    # Triton reload best-effort
     try:
         triton_unload(str(model))
         triton_load(str(model))
@@ -315,19 +263,13 @@ def rollback_minimal(ti, **_) -> None:
 
 
 def rollback_manual(model: str | None = None, deploy_version: int | None = None) -> None:
-    """
-    수동 롤백: base_model(best_model) 전용 권장
-
-    - deploy_version이 주어지면 current.json + config.pbtxt를 해당 버전 기준으로 강제 갱신 후 reload
-    - deploy_version이 없으면 reload만 수행
-    """
     model = str(model or cfg("triton_model_name", required=True))
     repo = cfg("triton_repo_base", "/models")
     model_dir = os.path.join(str(repo), model)
     os.makedirs(model_dir, exist_ok=True)
 
     path = os.path.join(model_dir, "current.json")
-    cur: Dict[str, Any] = {}
+    cur: dict[str, Any] = {}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
