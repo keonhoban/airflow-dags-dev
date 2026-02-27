@@ -1,17 +1,34 @@
 # dags/mlops_lib/core/ids.py
 from __future__ import annotations
 
-# -----------------------
+"""
+SSOT (Single Source of Truth)
+
+- DAG ID
+- TaskGroup IDs
+- Task IDs (TaskGroup 포함 형태까지)
+- XCom keys
+- Shadow reason codes
+- Triton deploy 관련 key
+
+이 파일은 "문자열 하드코딩 제거"를 위한 중앙 정의 지점입니다.
+DAG / pipelines / ml_code 어디에서도 문자열을 직접 쓰지 않습니다.
+"""
+
+# ============================================================
 # DAG / TaskGroups (SSOT)
-# -----------------------
+# ============================================================
+
 DAG_ID_E2E_FULL = "e2e_full"
+
 TG_DP = "dp"
 TG_DEPLOY = "deploy"
 
-# -----------------------
+# ============================================================
 # Task IDs (SSOT)
-# -----------------------
-# (TaskGroup 포함된 task_id는 "tg.task" 형태가 됩니다)
+# ============================================================
+
+# --- DP TaskGroup ---
 DP_EXTRACT_TASK_ID = f"{TG_DP}.extract_raw_data"
 DP_VALIDATE_TASK_ID = f"{TG_DP}.validate_data"
 DP_BUILD_TASK_ID = f"{TG_DP}.build_features"
@@ -19,6 +36,7 @@ DP_STORE_TASK_ID = f"{TG_DP}.store_features"
 
 SUMMARIZE_TASK_ID = "summarize_run"
 
+# --- Train / Branch ---
 TRAIN_TASK_ID = "train_and_evaluate"
 BRANCH_TASK_ID = "check_result"
 REGISTER_TASK_ID = "register_model_task"
@@ -29,7 +47,7 @@ NOTIFY_FAILURE_TASK_ID = "notify_failure"
 
 SENSOR_MODEL_READY_TASK_ID = "check_model_ready"
 
-# Deploy TaskGroup
+# --- Deploy TaskGroup ---
 DEPLOY_SNAPSHOT_TASK_ID = f"{TG_DEPLOY}.snapshot_current"
 DEPLOY_MATERIALIZE_TASK_ID = f"{TG_DEPLOY}.materialize_repo"
 DEPLOY_TRITON_LOAD_TASK_ID = f"{TG_DEPLOY}.triton_load"
@@ -40,9 +58,10 @@ COMMIT_CURRENT_TASK_ID = "commit_current"
 FASTAPI_RELOAD_TASK_ID = "fastapi_reload"
 ROLLBACK_MINIMAL_TASK_ID = "rollback_minimal"
 
-# -----------------------
-# XCom keys (SSOT) - pipeline scope
-# -----------------------
+# ============================================================
+# XCom keys (Pipeline scope SSOT)
+# ============================================================
+
 XCOM_ALIAS = "alias"
 XCOM_MODEL_NAME = "model_name"
 XCOM_ACCURACY = "accuracy"
@@ -55,16 +74,18 @@ XCOM_FS_SCHEMA_HASH = "fs_schema_hash"
 
 XCOM_SHADOW_REASON = "shadow_reason"
 
-# -----------------------
-# Shadow reasons (SSOT)
-# -----------------------
+# ============================================================
+# Shadow reason codes (SSOT)
+# ============================================================
+
 SHADOW_REASON_TRAIN_SKIPPED = "train_skipped"
 SHADOW_REASON_ACCURACY_INVALID = "accuracy_invalid"
 SHADOW_REASON_BELOW_THRESHOLD = "below_threshold"
 
-# -----------------------
+# ============================================================
 # Triton XCom keys (SSOT)
-# -----------------------
+# ============================================================
+
 K_MODEL = "model"
 K_MODEL_DIR = "model_dir"
 K_DEPLOY_VERSION = "deploy_version"
@@ -77,8 +98,9 @@ K_ONNX_INPUT_NAME = "onnx_input_name"
 
 K_PREV_CURRENT = "prev_current"
 
-# -----------------------
-# Triton task ids (SSOT)
-# -----------------------
+# ============================================================
+# Triton Task ID alias (가독성용)
+# ============================================================
+
 TRITON_MAT_TASK_ID = DEPLOY_MATERIALIZE_TASK_ID
 TRITON_SNAPSHOT_TASK_ID = DEPLOY_SNAPSHOT_TASK_ID
