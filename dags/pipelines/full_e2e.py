@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.exceptions import AirflowException
 
 from mlops_lib.core.ids import (
     # task ids
@@ -67,8 +68,10 @@ from ml_code.triton_tasks import (
 
 from ml_code.trigger_reload import trigger_reload
 
-# ✅ Observability (metric-based auto rollback)
-from mlops_lib.observability.auto_rollback import observe_and_fail_if_bad
+# ✅ Observability (metric-based auto rollback) - "근본 해결"
+# - 없는 함수 observe_and_fail_if_bad 를 import 하지 않음
+# - 실제로 import OK 확인된 AutoRollback만 사용
+from mlops_lib.observability.auto_rollback import AutoRollback
 
 log = LoggingMixin().log
 
@@ -288,8 +291,19 @@ def fastapi_reload_task(**context: Any) -> None:
 # -----------------------
 def observe_post_deploy_metrics(**context: Any) -> None:
     """
-    배포 후 N초~N분 관측하면서
-    - error-rate/latency 임계치 초과 시 task 실패 -> rollback_minimal 트리거
+    배포 후 관측 결과가 나쁘면 task 실패 -> e2e_full.py에서 rollback_minimal 트리거
+    - 여기서는 '결정'만 내리고
+    - 롤백 실행은 DAG(trigger_rule=ONE_FAILED)에게 맡긴다 (오케스트레이션 SSOT)
     """
     s = Settings.load()
-    observe_and_fail_if_bad(env=s.env)
+
+    ar = AutoRollback()
+    decision = ar.evaluate()
+
+    # decision.signals 예: {'min_up': 1.0, '5xx_ratio': 0.0, 'p95_latency_sec': 0.02, ...}
+    log.info("[observe_post_deploy_metrics] env=%s decision=%s signals=%s",
+             s.env, decision.reason, getattr(decision, "signals", None))
+
+    if getattr(decision, "should_rollback", False):
+        # 실패시키면 rollback_minimal(TriggerRule.ONE_FAILED)이 실행됨
+        raise AirflowException(f"[AUTO-ROLLBACK] {decision.reason} | signals={decision.signals}")
