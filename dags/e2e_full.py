@@ -19,11 +19,11 @@ from mlops_lib.core.ids import (
     DAG_ID_E2E_FULL,
     TG_DP,
     TG_DEPLOY,
-    # tasks
-    T_DP_EXTRACT_TASK_ID,
-    T_DP_VALIDATE_TASK_ID,
-    T_DP_BUILD_TASK_ID,
-    T_DP_STORE_TASK_ID,
+    # Task IDs (SSOT)
+    DP_EXTRACT_TASK_ID,
+    DP_VALIDATE_TASK_ID,
+    DP_BUILD_TASK_ID,
+    DP_STORE_TASK_ID,
     SUMMARIZE_TASK_ID,
     TRAIN_TASK_ID,
     BRANCH_TASK_ID,
@@ -36,9 +36,6 @@ from mlops_lib.core.ids import (
     FASTAPI_RELOAD_TASK_ID,
     ROLLBACK_MINIMAL_TASK_ID,
 )
-
-# NOTE: e2e_full.py에서 TaskGroup 내부 task_id는 TG로 자동 prefix됩니다.
-# ids.py에는 "dp.store_features" 같은 full-id도 있지만, DAG에서는 task_id는 "store_features"로 만들어야 합니다.
 
 from mlops_lib.core.policy import (
     E2E_START_DATE_YMD,
@@ -69,12 +66,20 @@ with DAG(
     on_failure_callback=alert_slack,
     dagrun_timeout=timedelta(minutes=E2E_DAGRUN_TIMEOUT_MIN),
 ) as dag:
+    """
+    NOTE (운영/제출 기준 SSOT):
+    - TaskGroup 내부에서 operator를 만들 때는 짧은 task_id(예: "store_features")로 생성합니다.
+    - 하지만 실제 DAG의 full task_id는 "{group_id}.{task_id}" (예: "dp.store_features") 입니다.
+    - XCom pull / task_ids 참조는 반드시 ids.py의 "full task_id" SSOT 값을 사용합니다.
+    """
 
     def mk_py(task_id: str, fn, *, trigger_rule=TriggerRule.ALL_SUCCESS) -> PythonOperator:
         return PythonOperator(task_id=task_id, python_callable=fn, trigger_rule=trigger_rule)
 
     # 1) Data pipeline
     with TaskGroup(group_id=TG_DP) as dp:
+        # ids.py는 full task_id("dp.extract_raw_data")를 제공하지만,
+        # operator 생성은 TG 내부이므로 task_id는 suffix만 사용합니다.
         extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
         validate_data = mk_py("validate_data", p.dp_validate)
         build_features = mk_py("build_features", p.dp_build)
@@ -89,7 +94,7 @@ with DAG(
 
     branch = BranchPythonOperator(
         task_id=BRANCH_TASK_ID,
-        python_callable=p.branch_by_accuracy,  # -> register_model_task OR shadow_start
+        python_callable=p.branch_by_accuracy,  # -> REGISTER_TASK_ID OR SHADOW_START_TASK_ID
     )
 
     promotion_start = EmptyOperator(task_id=PROMOTION_START_TASK_ID)
@@ -106,6 +111,7 @@ with DAG(
         mode=MODEL_READY_MODE,
     )
 
+    # shadow path reason notify (train skipped / below threshold / invalid accuracy)
     notify_failure = mk_py(
         NOTIFY_FAILURE_TASK_ID,
         p.notify_shadow_reason,
@@ -131,21 +137,35 @@ with DAG(
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    rollback_minimal = mk_py(ROLLBACK_MINIMAL_TASK_ID, p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
-
     # 5) Promotion-only
     commit_current = mk_py(COMMIT_CURRENT_TASK_ID, p.commit_current)
+
+    # 정책: FastAPI reload 실패는 자동 롤백하지 않음 (repo 되돌림은 위험)
     fastapi_reload = mk_py(FASTAPI_RELOAD_TASK_ID, p.fastapi_reload_task)
 
+    # deploy/commit 실패 시 최소 롤백
+    rollback_minimal = mk_py(
+        ROLLBACK_MINIMAL_TASK_ID,
+        p.triton_rollback_task,
+        trigger_rule=TriggerRule.ONE_FAILED,
+    )
+
+    # -----------------------
     # Dependencies
+    # -----------------------
     dp >> train >> branch
 
+    # branch targets
     branch >> register >> promotion_start
     branch >> shadow_start >> notify_failure
 
+    # promotion path must wait for model ready
     promotion_start >> check_model_ready >> deploy
+
+    # shadow path goes directly to deploy (shadow materialize)
     shadow_start >> deploy
 
+    # commit + reload only after deploy
     deploy >> commit_current >> fastapi_reload
 
     # rollback policy
