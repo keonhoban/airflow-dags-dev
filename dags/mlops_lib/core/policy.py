@@ -7,10 +7,29 @@ from typing import Optional
 from airflow.models import Variable
 
 from utils.slack_alerts import notify_info, notify_skip, notify_success
+from mlops_lib.core.ids import (
+    SHADOW_REASON_TRAIN_SKIPPED,
+    SHADOW_REASON_ACCURACY_INVALID,
+    SHADOW_REASON_BELOW_THRESHOLD,
+)
 
-# -----------------------
+"""
+Policy SSOT
+
+- DAG 정책값(재시도/timeout/센서 모드 등)
+- Triton timeouts
+- Runtime Settings (Airflow Variable 기반)
+- Slack notify wrapper (표준 메시지 포맷)
+
+목표:
+- DAG/파이프라인 코드에서 숫자/문자열 하드코딩 제거
+- 운영/면접에서 "정책은 한 곳에서 관리"를 증명
+"""
+
+# ============================================================
 # Airflow DAG policies (SSOT)
-# -----------------------
+# ============================================================
+
 E2E_START_DATE_YMD = (2025, 1, 1)
 E2E_RETRIES = 1
 E2E_RETRY_DELAY_MIN = 2
@@ -21,16 +40,31 @@ MODEL_READY_POKE_INTERVAL_SEC = 10
 MODEL_READY_TIMEOUT_SEC = 180
 MODEL_READY_MODE = "reschedule"
 
-# ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음 (model repo SSOT를 되돌리는 건 위험)
+# ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음
+# (model repo SSOT(current.json / config.pbtxt)를 되돌리는 건 위험)
 ROLLBACK_ON_FASTAPI_RELOAD_FAILURE = False
 
-# -----------------------
+# ============================================================
 # Triton timeouts (SSOT)
-# -----------------------
+# ============================================================
+
 T_TRITON_UNLOAD = 10
 T_TRITON_LOAD = 10
 T_TRITON_READY = 5
 T_TRITON_INFER = 10
+
+# ============================================================
+# Airflow Variable keys (SSOT)  - 오타 방지용
+# ============================================================
+
+VAR_TRITON_ENV = "triton_env"
+VAR_ACCURACY_THRESHOLD = "accuracy_threshold"
+VAR_LOGREG_C = "logreg_C"
+VAR_LOGREG_MAX_ITER = "logreg_max_iter"
+VAR_TRITON_MODEL_NAME = "triton_model_name"
+VAR_MODEL_NAME = "model_name"
+VAR_MLFLOW_ALIAS = "mlflow_alias"
+VAR_CODE_VERSION = "code_version"
 
 
 def _v(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -56,6 +90,14 @@ def _to_int(raw: Optional[str], default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
+    """
+    Runtime Settings (Variable 기반)
+
+    - 이 값들은 "DAG 실행 중"에도 Variable로 조정 가능
+    - 하지만 파이프라인 안정성을 위해, train 시작 시점에 XCom으로 고정해두는 전략을 권장
+      (현재 pipelines/full_e2e.py에서 alias/model_name을 XCom에 push하고 있음)
+    """
+
     env: str
     accuracy_threshold: float
     logreg_c: float
@@ -66,16 +108,17 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
-        env = (_v("triton_env", "dev") or "dev").strip()
-        th = _to_float(_v("accuracy_threshold", "0.60"), 0.60)
+        env = (_v(VAR_TRITON_ENV, "dev") or "dev").strip()
+        th = _to_float(_v(VAR_ACCURACY_THRESHOLD, "0.60"), 0.60)
 
-        c = _to_float(_v("logreg_C", "1.0"), 1.0)
-        it = _to_int(_v("logreg_max_iter", "200"), 200)
+        c = _to_float(_v(VAR_LOGREG_C, "1.0"), 1.0)
+        it = _to_int(_v(VAR_LOGREG_MAX_ITER, "200"), 200)
 
-        model_name = (_v("triton_model_name", _v("model_name", "best_model")) or "best_model").strip()
-        alias = (_v("mlflow_alias", "A") or "A").strip()
+        model_name = (_v(VAR_TRITON_MODEL_NAME, _v(VAR_MODEL_NAME, "best_model")) or "best_model").strip()
+        alias = (_v(VAR_MLFLOW_ALIAS, "A") or "A").strip()
 
-        code_version = (_v("code_version", None) or None)
+        # 제출/운영용: git sha 같은 버전값을 Variable로 주입 가능(없으면 None)
+        code_version = (_v(VAR_CODE_VERSION, None) or None)
         if code_version is not None:
             code_version = str(code_version).strip() or None
 
@@ -90,9 +133,10 @@ class Settings:
         )
 
 
-# -----------------------
+# ============================================================
 # Slack notify helpers (SSOT)
-# -----------------------
+# ============================================================
+
 def notify_train_completed(
     *,
     env: str,
@@ -116,10 +160,21 @@ def notify_train_completed(
 
 
 def notify_branch_promotion(*, env: str, accuracy: float, threshold: float) -> None:
-    notify_info("Branch: promotion", env=env, accuracy=f"{float(accuracy):.4f}", threshold=str(threshold))
+    notify_info(
+        "Branch: promotion",
+        env=env,
+        accuracy=f"{float(accuracy):.4f}",
+        threshold=str(threshold),
+    )
 
 
-def notify_branch_shadow(*, env: str, reason: str, threshold: float, accuracy: Optional[float] = None) -> None:
+def notify_branch_shadow(
+    *,
+    env: str,
+    reason: str,
+    threshold: float,
+    accuracy: Optional[float] = None,
+) -> None:
     fields = {"env": env, "threshold": str(threshold), "reason": str(reason)}
     if accuracy is not None:
         fields["accuracy"] = f"{float(accuracy):.4f}"
@@ -132,16 +187,31 @@ def notify_register_completed(*, env: str, model: str, alias: str, version: int)
         env=env,
         model=model,
         alias=alias,
-        version=str(version),
+        version=str(int(version)),
     )
 
 
 def notify_shadow_reason(*, env: str, reason: Optional[str]) -> None:
+    """
+    Shadow로 빠진 이유(SSOT) 기준으로 Slack 메시지를 표준화합니다.
+    """
     title = "Shadow path selected"
-    if reason == "train_skipped":
+
+    if reason == SHADOW_REASON_TRAIN_SKIPPED:
         notify_skip(title, env=env, reason="train skipped", next_action="데이터/피처/라벨 조건 확인")
         return
-    if reason == "accuracy_invalid":
+
+    if reason == SHADOW_REASON_ACCURACY_INVALID:
         notify_skip(title, env=env, reason="accuracy invalid", next_action="train task의 accuracy 산출/형 변환 확인")
         return
-    notify_skip(title, env=env, reason="accuracy below threshold", next_action="feature/label/model 개선 후 재시도")
+
+    # default: below threshold
+    if reason is None:
+        reason = SHADOW_REASON_BELOW_THRESHOLD
+
+    notify_skip(
+        title,
+        env=env,
+        reason="accuracy below threshold",
+        next_action="feature/label/model 개선 후 재시도",
+    )

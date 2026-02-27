@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from typing import Any
-
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from mlops_lib.core.ids import (
+    # task ids
     DP_STORE_TASK_ID,
     DP_BUILD_TASK_ID,
     TRAIN_TASK_ID,
@@ -13,7 +13,7 @@ from mlops_lib.core.ids import (
     REGISTER_TASK_ID,
     DEPLOY_MATERIALIZE_TASK_ID,
     SHADOW_START_TASK_ID,
-    # XCom keys
+    # xcom keys (pipeline scope)
     XCOM_ALIAS,
     XCOM_MODEL_NAME,
     XCOM_ACCURACY,
@@ -23,10 +23,11 @@ from mlops_lib.core.ids import (
     XCOM_FS_VERSION,
     XCOM_FS_SCHEMA_HASH,
     XCOM_SHADOW_REASON,
+    # shadow reason (SSOT)
     SHADOW_REASON_TRAIN_SKIPPED,
     SHADOW_REASON_ACCURACY_INVALID,
     SHADOW_REASON_BELOW_THRESHOLD,
-    # Triton XCom keys (from triton_tasks materialize)
+    # triton xcom keys (SSOT)
     K_DEPLOY_MODE as TRITON_XCOM_DEPLOY_MODE,
     K_DEPLOY_VERSION as TRITON_XCOM_DEPLOY_VERSION,
     K_RUN_ID as TRITON_XCOM_RUN_ID,
@@ -68,12 +69,11 @@ from ml_code.trigger_reload import trigger_reload
 
 log = LoggingMixin().log
 
-
 """
 ✅ This module contains ONLY orchestration callables used by DAG entrypoints.
 - No DAG() definitions here.
-- SSOT for task_id/xcom keys lives in mlops_lib.core.ids
-- Policy(Settings/notify) lives in mlops_lib.core.policy
+- SSOT for task_id/xcom keys: mlops_lib.core.ids
+- Policy(Settings/notify): mlops_lib.core.policy
 """
 
 
@@ -88,7 +88,7 @@ def train_and_evaluate(**context: Any) -> None:
     fs_version = ti.xcom_pull(key=XCOM_FS_VERSION, task_ids=DP_STORE_TASK_ID)
     schema_hash = ti.xcom_pull(key=XCOM_FS_SCHEMA_HASH, task_ids=DP_BUILD_TASK_ID)
 
-    # DAG 기준 SSOT를 XCom에 기록 (후속 task에서 Settings 변동에도 안전)
+    # ✅ DAG 기준 SSOT를 XCom에 기록 (후속 task에서 Settings 변동에도 안전)
     ti.xcom_push(key=XCOM_ALIAS, value=s.alias)
     ti.xcom_push(key=XCOM_MODEL_NAME, value=s.model_name)
 
@@ -102,12 +102,10 @@ def train_and_evaluate(**context: Any) -> None:
             env=s.env,
             code_version=s.code_version,
         )
-    except TrainSkippableError as e:
+    except TrainSkippableError:
+        # ✅ train은 "결과만" 남김. shadow reason 결정은 branch가 SSOT.
         ti.xcom_push(key=XCOM_ACCURACY, value=None)
         ti.xcom_push(key=XCOM_RUN_ID, value=None)
-        # shadow reason은 branch에서 SSOT로 사용
-        ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_TRAIN_SKIPPED)
-        notify_branch_shadow(env=s.env, reason="train_skipped", threshold=s.accuracy_threshold)
         return
 
     ti.xcom_push(key=XCOM_ACCURACY, value=float(acc))
