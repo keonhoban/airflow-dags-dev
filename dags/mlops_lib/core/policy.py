@@ -20,6 +20,7 @@ Policy SSOT
 - Triton timeouts
 - Runtime Settings (Airflow Variable 기반)
 - Slack notify wrapper (표준 메시지 포맷)
+- Observability 정책(자동 롤백용 Prometheus settings / thresholds / promql)
 
 목표:
 - DAG/파이프라인 코드에서 숫자/문자열 하드코딩 제거
@@ -66,6 +67,28 @@ VAR_MODEL_NAME = "model_name"
 VAR_MLFLOW_ALIAS = "mlflow_alias"
 VAR_CODE_VERSION = "code_version"
 
+# ============================================================
+# Observability / Auto Rollback (SSOT)
+# ============================================================
+
+# Prometheus endpoint
+VAR_PROMETHEUS_BASE_URL = "prometheus_base_url"  # e.g. http://prometheus-operated.monitoring.svc.cluster.local:9090
+VAR_PROMETHEUS_BEARER_TOKEN = "prometheus_bearer_token"  # optional
+VAR_PROMETHEUS_VERIFY_TLS = "prometheus_verify_tls"  # true/false
+
+# Observe window params
+VAR_OBSERVE_WINDOW_SEC = "observe_window_sec"  # default 180
+VAR_OBSERVE_STEP_SEC = "observe_step_sec"  # default 15
+VAR_OBSERVE_POKE_INTERVAL_SEC = "observe_poke_interval_sec"  # default 20
+
+# Thresholds
+VAR_ERROR_RATE_THRESHOLD = "observe_error_rate_threshold"  # default 0.02 (2%)
+VAR_LATENCY_P95_THRESHOLD_SEC = "observe_latency_p95_threshold_sec"  # default 0.8 (sec)
+
+# PromQL overrides (metric/label 다르면 이걸로 바꾸면 됨)
+VAR_PROMQL_ERROR_RATE = "promql_error_rate"
+VAR_PROMQL_LATENCY_P95 = "promql_latency_p95"
+
 
 def _v(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
@@ -86,6 +109,20 @@ def _to_int(raw: Optional[str], default: int) -> int:
         return int(str(raw))
     except Exception:
         return default
+
+
+def _to_bool(raw: Optional[str], default: bool) -> bool:
+    """
+    Airflow Variable의 문자열을 bool로 변환 (SSOT)
+    """
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 @dataclass(frozen=True)

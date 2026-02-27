@@ -113,14 +113,17 @@ with DAG(
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
-    # deploy/commit 실패 시 최소 롤백
+    # deploy/commit/observe 실패 시 최소 롤백
     rollback_minimal = mk_py("rollback_minimal", p.triton_rollback_task, trigger_rule=TriggerRule.ONE_FAILED)
 
-    # 5) Promotion-only
-    commit_current = mk_py("commit_current", p.commit_current)
-
-    # ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음(모델 repo 되돌림은 위험)
+    # ✅ FastAPI reload 실패는 자동 롤백하지 않음(정책 유지)
     fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
+
+    # ✅ 배포 후 관측(임계치 초과 시 실패 -> rollback 트리거)
+    observe_metrics = mk_py("observe_metrics", p.observe_post_deploy_metrics)
+
+    # 5) commit (promotion-only 의미지만, 파이프라인 SSOT 관점에서 공통 체인으로 둠)
+    commit_current = mk_py("commit_current", p.commit_current)
 
     # Dependencies
     dp >> train >> branch
@@ -131,13 +134,16 @@ with DAG(
     promotion_start >> check_model_ready >> deploy
     shadow_start >> deploy
 
-    deploy >> commit_current >> fastapi_reload
+    # ✅ deploy 후: reload -> observe -> commit
+    deploy >> fastapi_reload >> observe_metrics >> commit_current
 
-    # rollback policy
-    [deploy, commit_current] >> rollback_minimal
+    # rollback policy (fastapi_reload는 제외)
+    [deploy, observe_metrics, commit_current] >> rollback_minimal
 
     # summarize (always)
     store_features >> summarize_run
     fastapi_reload >> summarize_run
+    observe_metrics >> summarize_run
+    commit_current >> summarize_run
     rollback_minimal >> summarize_run
     notify_failure >> summarize_run

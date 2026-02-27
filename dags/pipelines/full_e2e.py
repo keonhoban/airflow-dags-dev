@@ -67,6 +67,9 @@ from ml_code.triton_tasks import (
 
 from ml_code.trigger_reload import trigger_reload
 
+# ✅ Observability (metric-based auto rollback)
+from mlops_lib.observability.auto_rollback import observe_and_fail_if_bad
+
 log = LoggingMixin().log
 
 """
@@ -278,3 +281,15 @@ def fastapi_reload_task(**context: Any) -> None:
         raise ValueError("FastAPI promotion reload 불가: deploy_version XCom 누락 (deploy.materialize_repo 확인 필요)")
 
     trigger_reload(str(al), deploy_version=int(deploy_version))
+
+
+# -----------------------
+# Post-deploy observation (Auto Rollback)
+# -----------------------
+def observe_post_deploy_metrics(**context: Any) -> None:
+    """
+    배포 후 N초~N분 관측하면서
+    - error-rate/latency 임계치 초과 시 task 실패 -> rollback_minimal 트리거
+    """
+    s = Settings.load()
+    observe_and_fail_if_bad(env=s.env)
