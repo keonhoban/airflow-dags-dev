@@ -80,10 +80,6 @@ VAR_DRIFT_KS_STAT_THRESHOLD = "drift_ks_stat_threshold"  # default 0.20
 VAR_DRIFT_SAMPLE_N = "drift_sample_n"  # default 2000
 VAR_DRIFT_MAX_COLS = "drift_max_columns"  # default 20
 
-# ✅ Drift Gate Test Mode (운영 latest 건드리지 않고 재현)
-VAR_DRIFT_TEST_ENABLED = "drift_test_enabled"  # default false
-VAR_DRIFT_TEST_REF_URI = "drift_test_ref_uri"  # e.g. s3://.../drift_ref/features.parquet
-
 # ============================================================
 # Observability / Auto Rollback (SSOT)
 # ============================================================
@@ -193,28 +189,12 @@ class DriftSettings:
     sample_n: int
     max_columns: int
 
-    # ✅ Test mode
-    test_enabled: bool
-    test_ref_uri: Optional[str]
-
     @classmethod
     def load(cls) -> "DriftSettings":
         ks_th = _to_float(_v(VAR_DRIFT_KS_STAT_THRESHOLD, "0.20"), 0.20)
         n = _to_int(_v(VAR_DRIFT_SAMPLE_N, "2000"), 2000)
         mc = _to_int(_v(VAR_DRIFT_MAX_COLS, "20"), 20)
-
-        test_enabled = _to_bool(_v(VAR_DRIFT_TEST_ENABLED, "false"), False)
-        test_ref_uri = (_v(VAR_DRIFT_TEST_REF_URI, None) or None)
-        if test_ref_uri is not None:
-            test_ref_uri = str(test_ref_uri).strip() or None
-
-        return cls(
-            ks_stat_threshold=ks_th,
-            sample_n=n,
-            max_columns=mc,
-            test_enabled=bool(test_enabled),
-            test_ref_uri=test_ref_uri,
-        )
+        return cls(ks_stat_threshold=ks_th, sample_n=n, max_columns=mc)
 
 
 def drift_settings() -> DriftSettings:
