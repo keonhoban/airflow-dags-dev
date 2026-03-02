@@ -31,6 +31,7 @@ from mlops_lib.core.ids import (
     SHADOW_REASON_TRAIN_SKIPPED,
     SHADOW_REASON_ACCURACY_INVALID,
     SHADOW_REASON_BELOW_THRESHOLD,
+    SHADOW_REASON_DRIFT_DETECTED,
     # triton xcom keys (SSOT)
     K_DEPLOY_MODE as TRITON_XCOM_DEPLOY_MODE,
     K_DEPLOY_VERSION as TRITON_XCOM_DEPLOY_VERSION,
@@ -151,12 +152,20 @@ def branch_by_accuracy(**context: Any) -> str:
     # ======================================================
     # 0) Drift gate 우선 (Pre-deploy 품질 게이트)
     # - drift_gate_task가 block이면 무조건 shadow로 보냄
-    # - shadow_reason은 drift_gate에서 SSOT로 이미 push됨
+    # - BUT: notify_failure는 BRANCH_TASK_ID의 XCom을 읽으므로
+    #        branch에서 shadow_reason을 한 번 더 SSOT로 남겨준다.
     # ======================================================
     drift_block = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_BLOCK_PROMOTION)
     if str(drift_block).strip().lower() in ("1", "true", "yes", "y", "on"):
-        reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"
-        log.warning("[branch_by_accuracy] drift_block=true -> shadow. drift_reason=%s", reason)
+        # ✅ 핵심: notify_shadow_reason()가 BRANCH_TASK_ID에서 읽게 보장
+        ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_DRIFT_DETECTED)
+
+        drift_reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"
+        log.warning("[branch_by_accuracy] drift_block=true -> shadow. drift_reason=%s", drift_reason)
+
+        # (선택) “Branch: shadow” 알림을 여기서도 남기고 싶으면 아래 라인 활성화 가능
+        # notify_branch_shadow(env=s.env, reason=SHADOW_REASON_DRIFT_DETECTED, threshold=s.accuracy_threshold)
+
         return SHADOW_START_TASK_ID
 
     acc = ti.xcom_pull(task_ids=TRAIN_TASK_ID, key=XCOM_ACCURACY)
