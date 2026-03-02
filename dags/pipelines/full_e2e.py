@@ -88,11 +88,6 @@ log = LoggingMixin().log
 
 
 # -----------------------
-# Data Pipeline wrappers (already imported as p.dp_extract etc.)
-# -----------------------
-
-
-# -----------------------
 # Drift Gate
 # -----------------------
 def drift_gate_task(**context: Any) -> None:

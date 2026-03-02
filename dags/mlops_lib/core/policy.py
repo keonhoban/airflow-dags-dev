@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+# NOTE:
+# Airflow 2.10+ / 3.x 계열에서 `airflow.models.Variable` 경고가 뜰 수 있음.
+# 현재는 동작에 문제 없고, 추후 `from airflow.sdk import Variable`로 이관하면 됨.
 from airflow.models import Variable
 
 from utils.slack_alerts import notify_info, notify_skip, notify_success
@@ -20,6 +23,7 @@ Policy SSOT
 - DAG 정책값(재시도/timeout/센서 모드 등)
 - Triton timeouts
 - Runtime Settings (Airflow Variable 기반)
+- Drift Gate 정책(Pre-deploy quality gate)
 - Slack notify wrapper (표준 메시지 포맷)
 - Observability 정책(자동 롤백용 Prometheus settings / thresholds / promql)
 
@@ -270,7 +274,12 @@ def notify_shadow_reason(*, env: str, reason: Optional[str]) -> None:
         return
 
     if reason == SHADOW_REASON_DRIFT_DETECTED:
-        notify_skip(title, env=env, reason="drift detected (pre-deploy gate)", next_action="feature contract / schema / data shift 확인")
+        notify_skip(
+            title,
+            env=env,
+            reason="drift detected (pre-deploy gate)",
+            next_action="feature contract / schema / data shift 확인",
+        )
         return
 
     # default: below threshold
