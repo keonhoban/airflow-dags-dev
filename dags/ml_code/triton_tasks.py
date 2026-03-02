@@ -83,6 +83,63 @@ def _snapshot_task_ids() -> Sequence[str]:
 
 
 # -----------------------
+# Quarantine dir helpers
+# -----------------------
+def _ensure_writable_quarantine_dir(model_dir: str) -> str:
+    """
+    NFS에서 _quarantine 디렉토리가 root:root 755로 남아있으면
+    airflow(uid=50000)가 그 아래에 write/rename을 못 해서 rollback이 깨질 수 있습니다.
+
+    정책:
+    1) model_dir/_quarantine 를 우선 사용 (가능하면 chmod 2775 시도)
+    2) 쓰기 불가하면 model_dir/_quarantine_airflow 로 폴백 (airflow가 직접 생성)
+
+    반환: 실제로 사용할 quarantine dir 경로
+    """
+    q1 = os.path.join(model_dir, "_quarantine")
+    q2 = os.path.join(model_dir, "_quarantine_airflow")
+
+    def _mkdir(p: str) -> None:
+        os.makedirs(p, exist_ok=True)
+
+    def _chmod_2775(p: str) -> None:
+        # best effort: 실패해도 폴백으로 해결 가능
+        try:
+            os.chmod(p, 0o2775)  # setgid + group write
+        except Exception as e:
+            log.warning("[QUARANTINE] chmod 2775 failed: path=%s err=%s", p, e)
+
+    def _is_writable_dir(p: str) -> bool:
+        try:
+            return os.path.isdir(p) and os.access(p, os.W_OK | os.X_OK)
+        except Exception:
+            return False
+
+    # 1) prefer _quarantine
+    try:
+        _mkdir(q1)
+        _chmod_2775(q1)
+        if _is_writable_dir(q1):
+            return q1
+        log.warning("[QUARANTINE] not writable: %s (will fallback)", q1)
+    except Exception as e:
+        log.warning("[QUARANTINE] prepare failed: %s err=%s (will fallback)", q1, e)
+
+    # 2) fallback: _quarantine_airflow
+    try:
+        _mkdir(q2)
+        _chmod_2775(q2)
+        if _is_writable_dir(q2):
+            log.warning("[QUARANTINE] using fallback dir: %s", q2)
+            return q2
+    except Exception as e:
+        log.warning("[QUARANTINE] fallback prepare failed: %s err=%s", q2, e)
+
+    # 마지막: 그래도 안되면 q1 반환(기존 동작 유지) -> rename 실패 로그로 남게 됨
+    return q1
+
+
+# -----------------------
 # Triton repo safety helpers
 # -----------------------
 def _sanitize_numeric_failed_dirs(model_dir: str) -> None:
@@ -98,8 +155,7 @@ def _sanitize_numeric_failed_dirs(model_dir: str) -> None:
         if not os.path.isdir(model_dir):
             return
 
-        qdir = os.path.join(model_dir, "_quarantine")
-        os.makedirs(qdir, exist_ok=True)
+        qdir = _ensure_writable_quarantine_dir(model_dir)
 
         for name in os.listdir(model_dir):
             if not name:
@@ -134,8 +190,7 @@ def _quarantine_failed_version_dir(*, model_dir: str, deploy_v: int) -> None:
     if not os.path.isdir(ver_dir):
         return
 
-    quarantine_dir = os.path.join(model_dir, "_quarantine")
-    os.makedirs(quarantine_dir, exist_ok=True)
+    quarantine_dir = _ensure_writable_quarantine_dir(model_dir)
 
     failed_name = f"failed_v{deploy_v}_{utc_ts()}"
     failed_dir = os.path.join(quarantine_dir, failed_name)
