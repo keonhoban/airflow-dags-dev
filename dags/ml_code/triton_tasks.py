@@ -83,6 +83,71 @@ def _snapshot_task_ids() -> Sequence[str]:
 
 
 # -----------------------
+# Triton repo safety helpers
+# -----------------------
+def _sanitize_numeric_failed_dirs(model_dir: str) -> None:
+    """
+    과거에 생성된 "56.failed_..." 같은 디렉토리가 남아있으면
+    Triton이 version=56 으로 오인 → /56/model.onnx stat 실패 → UNAVAILABLE로 남아서
+    model load / readiness를 계속 깨뜨릴 수 있습니다.
+
+    따라서 숫자로 시작하고 '.failed_'를 포함한 디렉토리는
+    _quarantine/ 아래로 이동해 Triton의 버전 스캔에서 완전히 제외합니다.
+    """
+    try:
+        if not os.path.isdir(model_dir):
+            return
+
+        qdir = os.path.join(model_dir, "_quarantine")
+        os.makedirs(qdir, exist_ok=True)
+
+        for name in os.listdir(model_dir):
+            if not name:
+                continue
+            # ex) "56.failed_2026..." 형태
+            if name[0].isdigit() and ".failed_" in name:
+                src = os.path.join(model_dir, name)
+                if os.path.isdir(src):
+                    dst = os.path.join(qdir, f"failed_{name}")
+                    log.warning("[SANITIZE] move numeric failed dir: %s -> %s", src, dst)
+                    try:
+                        os.rename(src, dst)
+                    except Exception as e:
+                        log.warning("[SANITIZE] rename failed: %s", e)
+    except Exception as e:
+        log.warning("[SANITIZE] failed: %s", e)
+
+
+def _quarantine_failed_version_dir(*, model_dir: str, deploy_v: int) -> None:
+    """
+    실패 버전 디렉토리를 안전하게 격리합니다.
+
+    ❌ 절대 금지:
+      - "56.failed_..." 같은 형태 (숫자로 시작) => Triton이 version=56으로 해석 가능
+
+    ✅ 권장:
+      - _quarantine/failed_v{version}_{ts}
+      - 숫자로 시작하지 않는 이름
+      - 루트 버전 디렉토리 스캔 영역 밖
+    """
+    ver_dir = os.path.join(model_dir, str(deploy_v))
+    if not os.path.isdir(ver_dir):
+        return
+
+    quarantine_dir = os.path.join(model_dir, "_quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+
+    failed_name = f"failed_v{deploy_v}_{utc_ts()}"
+    failed_dir = os.path.join(quarantine_dir, failed_name)
+
+    try:
+        os.rename(ver_dir, failed_dir)
+        log.warning("[ROLLBACK] moved failed dir: %s -> %s", ver_dir, failed_dir)
+    except Exception as e:
+        log.warning("[ROLLBACK] failed to move dir: %s -> %s err=%s", ver_dir, failed_dir, e)
+
+
+# -----------------------
 # Tasks
 # -----------------------
 def snapshot_current(ti, **_) -> None:
@@ -206,6 +271,12 @@ def commit_current(ti, **_) -> None:
 
 
 def rollback_minimal(ti, **_) -> None:
+    """
+    롤백 최소 단위:
+    - current.json snapshot 복원(가능하면)
+    - 실패 버전 dir 격리(중요: Triton version 파싱 안전)
+    - unload/load 재시도
+    """
     model = _xcom_pull_any(ti, key=K_MODEL, task_ids=_mat_task_ids())
     model_dir = _xcom_pull_any(ti, key=K_MODEL_DIR, task_ids=_mat_task_ids())
     deploy_v = _xcom_pull_any(ti, key=K_DEPLOY_VERSION, task_ids=_mat_task_ids())
@@ -236,6 +307,7 @@ def rollback_minimal(ti, **_) -> None:
 
     log.warning("[ROLLBACK] start model=%s deploy_version=%s mode=%s", model, deploy_v, deploy_mode)
 
+    # 1) current.json 복원 (promote 케이스만)
     if str(deploy_mode) != "shadow" and str(model) == str(base_model) and prev is not None and model_dir:
         path = os.path.join(str(model_dir), "current.json")
         try:
@@ -244,17 +316,17 @@ def rollback_minimal(ti, **_) -> None:
         except Exception as e:
             log.warning("[ROLLBACK] failed to restore current.json: %s", e)
 
+    # 2) 실패 버전 격리 (가장 중요)
     if deploy_v is not None:
         md = str(model_dir) if model_dir else os.path.join(str(repo), str(model))
-        ver_dir = os.path.join(md, str(deploy_v))
-        if os.path.isdir(ver_dir):
-            failed_dir = ver_dir + f".failed_{utc_ts()}"
-            try:
-                os.rename(ver_dir, failed_dir)
-                log.warning("[ROLLBACK] moved failed dir: %s -> %s", ver_dir, failed_dir)
-            except Exception as e:
-                log.warning("[ROLLBACK] failed to move dir: %s -> %s err=%s", ver_dir, failed_dir, e)
 
+        # 혹시 과거의 "숫자 failed dir"이 남아있으면 먼저 제거
+        _sanitize_numeric_failed_dirs(md)
+
+        # 이번 deploy_v 버전을 안전한 형태로 격리
+        _quarantine_failed_version_dir(model_dir=md, deploy_v=int(deploy_v))
+
+    # 3) Triton reload
     try:
         triton_unload(str(model))
         triton_load(str(model))
@@ -263,10 +335,19 @@ def rollback_minimal(ti, **_) -> None:
 
 
 def rollback_manual(model: str | None = None, deploy_version: int | None = None) -> None:
+    """
+    수동 롤백:
+    - active_version 강제 지정
+    - config.pbtxt 재생성
+    - unload/load
+    """
     model = str(model or cfg("triton_model_name", required=True))
     repo = cfg("triton_repo_base", "/models")
     model_dir = os.path.join(str(repo), model)
     os.makedirs(model_dir, exist_ok=True)
+
+    # 안전 장치: 숫자 failed dir 남아있으면 제거
+    _sanitize_numeric_failed_dirs(model_dir)
 
     path = os.path.join(model_dir, "current.json")
     cur: dict[str, Any] = {}
