@@ -36,6 +36,9 @@ DP_STORE_TASK_ID = f"{TG_DP}.store_features"
 
 SUMMARIZE_TASK_ID = "summarize_run"
 
+# --- Quality / Gate ---
+DRIFT_GATE_TASK_ID = "drift_gate"
+
 # --- Train / Branch ---
 TRAIN_TASK_ID = "train_and_evaluate"
 BRANCH_TASK_ID = "check_result"
@@ -72,7 +75,14 @@ XCOM_FS_FEATURE_URI = "fs_feature_uri"
 XCOM_FS_VERSION = "fs_version"
 XCOM_FS_SCHEMA_HASH = "fs_schema_hash"
 
+# dp/store.py가 이미 push 중인 key를 SSOT로 승격
+XCOM_FS_LATEST_PREFIX = "fs_latest_prefix"
+
 XCOM_SHADOW_REASON = "shadow_reason"
+
+# Drift gate 결과 SSOT
+XCOM_DRIFT_BLOCK_PROMOTION = "drift_block_promotion"  # bool
+XCOM_DRIFT_REASON = "drift_reason"  # str
 
 # ============================================================
 # Shadow reason codes (SSOT)
@@ -81,6 +91,7 @@ XCOM_SHADOW_REASON = "shadow_reason"
 SHADOW_REASON_TRAIN_SKIPPED = "train_skipped"
 SHADOW_REASON_ACCURACY_INVALID = "accuracy_invalid"
 SHADOW_REASON_BELOW_THRESHOLD = "below_threshold"
+SHADOW_REASON_DRIFT_DETECTED = "drift_detected"
 
 # ============================================================
 # Triton XCom keys (SSOT)

@@ -14,6 +14,7 @@ from mlops_lib.core.ids import (
     REGISTER_TASK_ID,
     DEPLOY_MATERIALIZE_TASK_ID,
     SHADOW_START_TASK_ID,
+    DRIFT_GATE_TASK_ID,
     # xcom keys (pipeline scope)
     XCOM_ALIAS,
     XCOM_MODEL_NAME,
@@ -24,6 +25,8 @@ from mlops_lib.core.ids import (
     XCOM_FS_VERSION,
     XCOM_FS_SCHEMA_HASH,
     XCOM_SHADOW_REASON,
+    XCOM_DRIFT_BLOCK_PROMOTION,
+    XCOM_DRIFT_REASON,
     # shadow reason (SSOT)
     SHADOW_REASON_TRAIN_SKIPPED,
     SHADOW_REASON_ACCURACY_INVALID,
@@ -69,9 +72,10 @@ from ml_code.triton_tasks import (
 from ml_code.trigger_reload import trigger_reload
 
 # ✅ Observability (metric-based auto rollback) - "근본 해결"
-# - 없는 함수 observe_and_fail_if_bad 를 import 하지 않음
-# - 실제로 import OK 확인된 AutoRollback만 사용
 from mlops_lib.observability.auto_rollback import AutoRollback
+
+# ✅ Drift Gate (Pre-deploy quality gate)
+from mlops_lib.quality.drift_gate import drift_gate
 
 log = LoggingMixin().log
 
@@ -81,6 +85,18 @@ log = LoggingMixin().log
 - SSOT for task_id/xcom keys: mlops_lib.core.ids
 - Policy(Settings/notify): mlops_lib.core.policy
 """
+
+
+# -----------------------
+# Data Pipeline wrappers (already imported as p.dp_extract etc.)
+# -----------------------
+
+
+# -----------------------
+# Drift Gate
+# -----------------------
+def drift_gate_task(**context: Any) -> None:
+    return drift_gate(**context)
 
 
 # -----------------------
@@ -136,6 +152,17 @@ def branch_by_accuracy(**context: Any) -> str:
     """
     s = Settings.load()
     ti = context["ti"]
+
+    # ======================================================
+    # 0) Drift gate 우선 (Pre-deploy 품질 게이트)
+    # - drift_gate_task가 block이면 무조건 shadow로 보냄
+    # - shadow_reason은 drift_gate에서 SSOT로 이미 push됨
+    # ======================================================
+    drift_block = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_BLOCK_PROMOTION)
+    if str(drift_block).strip().lower() in ("1", "true", "yes", "y", "on"):
+        reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"
+        log.warning("[branch_by_accuracy] drift_block=true -> shadow. drift_reason=%s", reason)
+        return SHADOW_START_TASK_ID
 
     acc = ti.xcom_pull(task_ids=TRAIN_TASK_ID, key=XCOM_ACCURACY)
 
@@ -300,10 +327,12 @@ def observe_post_deploy_metrics(**context: Any) -> None:
     ar = AutoRollback()
     decision = ar.evaluate()
 
-    # decision.signals 예: {'min_up': 1.0, '5xx_ratio': 0.0, 'p95_latency_sec': 0.02, ...}
-    log.info("[observe_post_deploy_metrics] env=%s decision=%s signals=%s",
-             s.env, decision.reason, getattr(decision, "signals", None))
+    log.info(
+        "[observe_post_deploy_metrics] env=%s decision=%s signals=%s",
+        s.env,
+        decision.reason,
+        getattr(decision, "signals", None),
+    )
 
     if getattr(decision, "should_rollback", False):
-        # 실패시키면 rollback_minimal(TriggerRule.ONE_FAILED)이 실행됨
         raise AirflowException(f"[AUTO-ROLLBACK] {decision.reason} | signals={decision.signals}")

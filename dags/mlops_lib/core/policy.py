@@ -11,6 +11,7 @@ from mlops_lib.core.ids import (
     SHADOW_REASON_TRAIN_SKIPPED,
     SHADOW_REASON_ACCURACY_INVALID,
     SHADOW_REASON_BELOW_THRESHOLD,
+    SHADOW_REASON_DRIFT_DETECTED,
 )
 
 """
@@ -66,6 +67,14 @@ VAR_TRITON_MODEL_NAME = "triton_model_name"
 VAR_MODEL_NAME = "model_name"
 VAR_MLFLOW_ALIAS = "mlflow_alias"
 VAR_CODE_VERSION = "code_version"
+
+# ============================================================
+# Drift Gate (SSOT)
+# ============================================================
+# 최소 스택/제출용: KS-stat(D) 기반 gate (p-value 없이도 재현 가능)
+VAR_DRIFT_KS_STAT_THRESHOLD = "drift_ks_stat_threshold"  # default 0.20
+VAR_DRIFT_SAMPLE_N = "drift_sample_n"  # default 2000
+VAR_DRIFT_MAX_COLS = "drift_max_columns"  # default 20
 
 # ============================================================
 # Observability / Auto Rollback (SSOT)
@@ -170,6 +179,24 @@ class Settings:
         )
 
 
+@dataclass(frozen=True)
+class DriftSettings:
+    ks_stat_threshold: float
+    sample_n: int
+    max_columns: int
+
+    @classmethod
+    def load(cls) -> "DriftSettings":
+        ks_th = _to_float(_v(VAR_DRIFT_KS_STAT_THRESHOLD, "0.20"), 0.20)
+        n = _to_int(_v(VAR_DRIFT_SAMPLE_N, "2000"), 2000)
+        mc = _to_int(_v(VAR_DRIFT_MAX_COLS, "20"), 20)
+        return cls(ks_stat_threshold=ks_th, sample_n=n, max_columns=mc)
+
+
+def drift_settings() -> DriftSettings:
+    return DriftSettings.load()
+
+
 # ============================================================
 # Slack notify helpers (SSOT)
 # ============================================================
@@ -240,6 +267,10 @@ def notify_shadow_reason(*, env: str, reason: Optional[str]) -> None:
 
     if reason == SHADOW_REASON_ACCURACY_INVALID:
         notify_skip(title, env=env, reason="accuracy invalid", next_action="train task의 accuracy 산출/형 변환 확인")
+        return
+
+    if reason == SHADOW_REASON_DRIFT_DETECTED:
+        notify_skip(title, env=env, reason="drift detected (pre-deploy gate)", next_action="feature contract / schema / data shift 확인")
         return
 
     # default: below threshold

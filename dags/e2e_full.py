@@ -73,6 +73,11 @@ with DAG(
     summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
     # =========================================================
+    # 1.5) Drift Gate (Pre-deploy quality gate)
+    # =========================================================
+    drift_gate = mk_py("drift_gate", p.drift_gate_task)
+
+    # =========================================================
     # 2) Train / Branch
     # =========================================================
     train = mk_py("train_and_evaluate", p.train_and_evaluate)
@@ -152,7 +157,7 @@ with DAG(
     # =========================================================
     # Dependencies
     # =========================================================
-    dp >> train >> branch
+    dp >> drift_gate >> train >> branch
 
     branch >> register >> promotion_start
     branch >> shadow_start >> notify_failure
