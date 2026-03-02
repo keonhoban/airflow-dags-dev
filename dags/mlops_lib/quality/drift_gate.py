@@ -71,7 +71,9 @@ def _latest_feature_uri(latest_prefix: str) -> str:
 def drift_gate(**context: Any) -> None:
     """
     Pre-deploy drift gate:
-    - new fs_feature_uri vs fs_latest_prefix/features.parquet 비교
+    - new fs_feature_uri vs ref_uri 비교
+      - 기본: ref_uri = fs_latest_prefix/features.parquet
+      - 테스트 모드: ref_uri = drift_test_ref_uri (운영 latest 무변경)
     - KS stat worst가 threshold 초과 -> promotion 차단(Shadow-only)
     """
     ti = context["ti"]
@@ -84,18 +86,34 @@ def drift_gate(**context: Any) -> None:
     feature_uri = ti.xcom_pull(key=XCOM_FS_FEATURE_URI, task_ids=DP_STORE_TASK_ID)
     latest_prefix = ti.xcom_pull(key=XCOM_FS_LATEST_PREFIX, task_ids=DP_STORE_TASK_ID)
 
-    if not feature_uri or not latest_prefix:
+    if not feature_uri:
         d = DriftDecision(
             block_promotion=False,
-            reason="DRIFT_SKIPPED: missing feature_uri or latest_prefix",
-            signals={"feature_uri": feature_uri, "latest_prefix": latest_prefix},
+            reason="DRIFT_SKIPPED: missing feature_uri",
+            signals={"feature_uri": feature_uri},
         )
         ti.xcom_push(key=XCOM_DRIFT_BLOCK_PROMOTION, value=d.block_promotion)
         ti.xcom_push(key=XCOM_DRIFT_REASON, value=d.reason)
         log.info("[drift_gate] %s signals=%s", d.reason, d.signals)
         return
 
-    ref_uri = _latest_feature_uri(str(latest_prefix))
+    # ✅ ref_uri 결정: test override > latest
+    ref_uri = None
+    test_mode = bool(ds.test_enabled and ds.test_ref_uri)
+    if test_mode:
+        ref_uri = str(ds.test_ref_uri)
+    else:
+        if not latest_prefix:
+            d = DriftDecision(
+                block_promotion=False,
+                reason="DRIFT_SKIPPED: missing latest_prefix",
+                signals={"latest_prefix": latest_prefix},
+            )
+            ti.xcom_push(key=XCOM_DRIFT_BLOCK_PROMOTION, value=d.block_promotion)
+            ti.xcom_push(key=XCOM_DRIFT_REASON, value=d.reason)
+            log.info("[drift_gate] %s signals=%s", d.reason, d.signals)
+            return
+        ref_uri = _latest_feature_uri(str(latest_prefix))
 
     new_df = _read_feature_df(str(feature_uri), sample_n=sample_n)
     ref_df = _read_feature_df(str(ref_uri), sample_n=sample_n)
@@ -145,8 +163,9 @@ def drift_gate(**context: Any) -> None:
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_DRIFT_DETECTED)
 
     log.info(
-        "[drift_gate] %s feature_uri=%s ref_uri=%s sample_n=%s max_cols=%s stats_top=%s",
+        "[drift_gate] %s test_mode=%s feature_uri=%s ref_uri=%s sample_n=%s max_cols=%s stats_top=%s",
         reason,
+        str(test_mode).lower(),
         feature_uri,
         ref_uri,
         sample_n,
