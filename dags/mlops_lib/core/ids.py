@@ -13,6 +13,10 @@ SSOT (Single Source of Truth)
 
 이 파일은 "문자열 하드코딩 제거"를 위한 중앙 정의 지점입니다.
 DAG / pipelines / ml_code 어디에서도 문자열을 직접 쓰지 않습니다.
+
+- 기존 상수들은 그대로 유지(호환성)
+- DAG 파일 import 압축을 위해 E2E 클래스(alias 집합) 추가
+- OBSERVE task_id 네이밍 정합성 개선
 """
 
 # ============================================================
@@ -59,6 +63,10 @@ DEPLOY_TRITON_SMOKE_TASK_ID = f"{TG_DEPLOY}.triton_infer_smoke"
 
 COMMIT_CURRENT_TASK_ID = "commit_current"
 FASTAPI_RELOAD_TASK_ID = "fastapi_reload"
+
+# ✅ 정합성 개선: callable 의미와 task_id를 같은 어휘로 맞춤
+OBSERVE_METRICS_TASK_ID = "observe_post_deploy_metrics"
+
 ROLLBACK_MINIMAL_TASK_ID = "rollback_minimal"
 
 # ============================================================
@@ -115,3 +123,46 @@ K_PREV_CURRENT = "prev_current"
 
 TRITON_MAT_TASK_ID = DEPLOY_MATERIALIZE_TASK_ID
 TRITON_SNAPSHOT_TASK_ID = DEPLOY_SNAPSHOT_TASK_ID
+
+
+# ============================================================
+# DAG import 압축용 alias 묶음 (NEW)
+# - DAG 파일은 "from ids import E2E as I" 하나로 끝낼 수 있음
+# - 기존 상수는 유지되므로 다른 모듈 영향 없음
+# ============================================================
+
+class E2E:
+    # dag / tg
+    DAG_ID = DAG_ID_E2E_FULL
+    TG_DP = TG_DP
+    TG_DEPLOY = TG_DEPLOY
+
+    # dp
+    DP_EXTRACT = DP_EXTRACT_TASK_ID
+    DP_VALIDATE = DP_VALIDATE_TASK_ID
+    DP_BUILD = DP_BUILD_TASK_ID
+    DP_STORE = DP_STORE_TASK_ID
+    SUMMARIZE = SUMMARIZE_TASK_ID
+
+    # gate/train/branch
+    DRIFT_GATE = DRIFT_GATE_TASK_ID
+    TRAIN = TRAIN_TASK_ID
+    BRANCH = BRANCH_TASK_ID
+    REGISTER = REGISTER_TASK_ID
+    PROMOTION_START = PROMOTION_START_TASK_ID
+    SHADOW_START = SHADOW_START_TASK_ID
+    NOTIFY_FAILURE = NOTIFY_FAILURE_TASK_ID
+    SENSOR_MODEL_READY = SENSOR_MODEL_READY_TASK_ID
+
+    # deploy
+    DEPLOY_SNAPSHOT = DEPLOY_SNAPSHOT_TASK_ID
+    DEPLOY_MATERIALIZE = DEPLOY_MATERIALIZE_TASK_ID
+    DEPLOY_TRITON_LOAD = DEPLOY_TRITON_LOAD_TASK_ID
+    DEPLOY_TRITON_READY = DEPLOY_TRITON_READY_TASK_ID
+    DEPLOY_TRITON_SMOKE = DEPLOY_TRITON_SMOKE_TASK_ID
+
+    # post
+    COMMIT = COMMIT_CURRENT_TASK_ID
+    FASTAPI_RELOAD = FASTAPI_RELOAD_TASK_ID
+    OBSERVE = OBSERVE_METRICS_TASK_ID
+    ROLLBACK_MINIMAL = ROLLBACK_MINIMAL_TASK_ID

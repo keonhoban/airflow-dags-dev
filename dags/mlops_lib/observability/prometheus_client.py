@@ -5,11 +5,16 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import requests
 from airflow.models import Variable
 
+from mlops_lib.core.policy import (
+    VAR_PROMETHEUS_BASE_URL,
+    VAR_PROMETHEUS_BEARER_TOKEN,
+    VAR_PROMETHEUS_VERIFY_TLS,
+)
 
 """
 Prometheus query client (SSOT)
@@ -19,14 +24,13 @@ Prometheus query client (SSOT)
 - DAG/오토롤백에서 "관측 쿼리"를 표준화
 - 네트워크/일시 오류에 강한 최소한의 재시도 제공
 
-권장:
-- Airflow Variable "prometheus_url" 로 URL 관리
-  예) http://monitoring-dev-kube-promet-prometheus.monitoring-dev.svc:9090
-- 로컬 포트포워드 환경이면 http://localhost:9090 도 가능
+SSOT:
+- Prometheus endpoint/token/verify_tls는 policy.py의 Variable key를 사용한다.
+- 단, 기존 호환을 위해 legacy key("prometheus_url") / env("PROMETHEUS_URL")도 fallback으로 지원한다.
 """
 
-
-VAR_PROMETHEUS_URL = "prometheus_url"
+# legacy (backward compatible)
+VAR_PROMETHEUS_URL_LEGACY = "prometheus_url"
 
 
 def _v(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -36,8 +40,15 @@ def _v(key: str, default: Optional[str] = None) -> Optional[str]:
         return default
 
 
-def _now_ts() -> float:
-    return time.time()
+def _to_bool(raw: Optional[str], default: bool) -> bool:
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 @dataclass(frozen=True)
@@ -47,15 +58,34 @@ class PrometheusConfig:
     retries: int = 2
     retry_backoff_sec: float = 0.6
 
+    # auth / tls
+    bearer_token: Optional[str] = None
+    verify_tls: bool = True
+
     @classmethod
     def load(cls) -> "PrometheusConfig":
-        # 1) Airflow Variable
-        v = _v(VAR_PROMETHEUS_URL, None)
-        # 2) env
-        e = os.environ.get("PROMETHEUS_URL")
-        # 3) default (port-forward friendly)
-        base = (v or e or "http://localhost:9090").strip().rstrip("/")
-        return cls(base_url=base)
+        # 1) SSOT (policy.py variable keys)
+        base = (_v(VAR_PROMETHEUS_BASE_URL, None) or "").strip()
+        token = (_v(VAR_PROMETHEUS_BEARER_TOKEN, None) or "").strip() or None
+        verify_tls = _to_bool(_v(VAR_PROMETHEUS_VERIFY_TLS, None), True)
+
+        # 2) legacy variable (backward compatible)
+        if not base:
+            base = (_v(VAR_PROMETHEUS_URL_LEGACY, None) or "").strip()
+
+        # 3) env fallback
+        if not base:
+            base = (os.environ.get("PROMETHEUS_URL", "") or "").strip()
+
+        # 4) default (port-forward friendly)
+        if not base:
+            base = "http://localhost:9090"
+
+        return cls(
+            base_url=base.rstrip("/"),
+            bearer_token=token,
+            verify_tls=verify_tls,
+        )
 
 
 class PrometheusError(RuntimeError):
@@ -66,13 +96,24 @@ class PrometheusClient:
     def __init__(self, config: Optional[PrometheusConfig] = None) -> None:
         self.cfg = config or PrometheusConfig.load()
 
+    def _headers(self) -> Dict[str, str]:
+        if not self.cfg.bearer_token:
+            return {}
+        return {"Authorization": f"Bearer {self.cfg.bearer_token}"}
+
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.cfg.base_url}{path}"
         last_err: Optional[Exception] = None
 
         for i in range(self.cfg.retries + 1):
             try:
-                r = requests.get(url, params=params, timeout=self.cfg.timeout_sec)
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers=self._headers(),
+                    timeout=self.cfg.timeout_sec,
+                    verify=self.cfg.verify_tls,
+                )
                 r.raise_for_status()
                 data = r.json()
                 if data.get("status") != "success":
@@ -85,7 +126,6 @@ class PrometheusClient:
                     continue
                 raise PrometheusError(f"Prometheus request failed: url={url}, err={e}") from e
 
-        # unreachable
         raise PrometheusError(str(last_err))
 
     # ---------------------------
@@ -118,11 +158,6 @@ class PrometheusClient:
     # ---------------------------
     @staticmethod
     def _extract_vector_first_value(resp: Dict[str, Any]) -> Optional[float]:
-        """
-        For instant query:
-        resp["data"]["resultType"] == "vector"
-        resp["data"]["result"] = [ {"value":[ts,"123.4"]}, ... ]
-        """
         data = resp.get("data") or {}
         if data.get("resultType") != "vector":
             return None
@@ -138,28 +173,17 @@ class PrometheusClient:
             return None
 
     def query_scalar(self, promql: str, *, default: Optional[float] = None) -> Optional[float]:
-        """
-        PromQL 결과가 vector(단일 스칼라 값)로 나오도록 작성한 query용.
-        예) sum(rate(...))
-        """
         resp = self.query(promql)
         v = self._extract_vector_first_value(resp)
         return v if v is not None else default
 
     def is_series_present(self, promql: str) -> bool:
-        """
-        값이 하나라도 나오면 True
-        """
         resp = self.query(promql)
         data = resp.get("data") or {}
         result = data.get("result") or []
         return bool(result)
 
     def min_up_in_namespace(self, *, namespace: str, job: str) -> Optional[float]:
-        """
-        fastapi-dev 네임스페이스에서 해당 job의 up 최소값.
-        - 2 pods면 up 2개가 나오는데, 그 중 하나라도 0이면 min이 0
-        """
         q = f'min(up{{namespace="{namespace}",job="{job}"}})'
         return self.query_scalar(q, default=None)
 

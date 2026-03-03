@@ -15,11 +15,8 @@ from airflow.utils.trigger_rule import TriggerRule
 from pipelines import full_e2e as p
 from utils.slack_alerts import alert_slack
 
-from mlops_lib.core.ids import (
-    DAG_ID_E2E_FULL,
-    TG_DP,
-    TG_DEPLOY,
-)
+# ✅ Import 압축: DAG는 E2E alias만 봄
+from mlops_lib.core.ids import E2E as I
 
 from mlops_lib.core.policy import (
     E2E_START_DATE_YMD,
@@ -41,8 +38,24 @@ DEFAULT_ARGS = {
 }
 
 
+def _suffix(task_id: str) -> str:
+    """
+    TaskGroup 내부 task_id는 group prefix 없이 들어가야 해서 suffix만 사용.
+    ex) "dp.store_features" -> "store_features"
+    """
+    return task_id.split(".", 1)[1] if "." in task_id else task_id
+
+
+def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
+    return PythonOperator(
+        task_id=task_id,
+        python_callable=fn,
+        trigger_rule=trigger_rule,
+    )
+
+
 with DAG(
-    dag_id=DAG_ID_E2E_FULL,
+    dag_id=I.DAG_ID,
     default_args=DEFAULT_ARGS,
     schedule=None,
     catchup=False,
@@ -52,51 +65,44 @@ with DAG(
     dagrun_timeout=timedelta(minutes=E2E_DAGRUN_TIMEOUT_MIN),
 ) as dag:
 
-    def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
-        return PythonOperator(
-            task_id=task_id,
-            python_callable=fn,
-            trigger_rule=trigger_rule,
-        )
-
     # =========================================================
     # 1) Data Pipeline
     # =========================================================
-    with TaskGroup(group_id=TG_DP) as dp:
-        extract_raw_data = mk_py("extract_raw_data", p.dp_extract)
-        validate_data = mk_py("validate_data", p.dp_validate)
-        build_features = mk_py("build_features", p.dp_build)
-        store_features = mk_py("store_features", p.dp_store)
+    with TaskGroup(group_id=I.TG_DP) as dp:
+        extract_raw_data = mk_py(_suffix(I.DP_EXTRACT), p.dp_extract)
+        validate_data = mk_py(_suffix(I.DP_VALIDATE), p.dp_validate)
+        build_features = mk_py(_suffix(I.DP_BUILD), p.dp_build)
+        store_features = mk_py(_suffix(I.DP_STORE), p.dp_store)
 
         extract_raw_data >> validate_data >> build_features >> store_features
 
-    summarize_run = mk_py("summarize_run", p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
+    summarize_run = mk_py(I.SUMMARIZE, p.dp_summary, trigger_rule=TriggerRule.ALL_DONE)
 
     # =========================================================
-    # 1.5) Drift Gate (Pre-deploy quality gate)
+    # 1.5) Drift Gate
     # =========================================================
-    drift_gate = mk_py("drift_gate", p.drift_gate_task)
+    drift_gate = mk_py(I.DRIFT_GATE, p.drift_gate_task)
 
     # =========================================================
     # 2) Train / Branch
     # =========================================================
-    train = mk_py("train_and_evaluate", p.train_and_evaluate)
+    train = mk_py(I.TRAIN, p.train_and_evaluate)
 
     branch = BranchPythonOperator(
-        task_id="check_result",
-        python_callable=p.branch_by_accuracy,  # -> register_model_task OR shadow_start
+        task_id=I.BRANCH,
+        python_callable=p.branch_by_accuracy,  # -> I.REGISTER OR I.SHADOW_START
     )
 
-    promotion_start = EmptyOperator(task_id="promotion_start")
-    shadow_start = EmptyOperator(task_id="shadow_start")
+    promotion_start = EmptyOperator(task_id=I.PROMOTION_START)
+    shadow_start = EmptyOperator(task_id=I.SHADOW_START)
 
     # =========================================================
     # 3) Promotion path
     # =========================================================
-    register = mk_py("register_model_task", p.register_model_task)
+    register = mk_py(I.REGISTER, p.register_model_task)
 
     check_model_ready = PythonSensor(
-        task_id="check_model_ready",
+        task_id=I.SENSOR_MODEL_READY,
         python_callable=p.sensor_ready_func,
         poke_interval=MODEL_READY_POKE_INTERVAL_SEC,
         timeout=MODEL_READY_TIMEOUT_SEC,
@@ -104,7 +110,7 @@ with DAG(
     )
 
     notify_failure = mk_py(
-        "notify_failure",
+        I.NOTIFY_FAILURE,
         p.notify_shadow_reason,
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
@@ -112,44 +118,44 @@ with DAG(
     # =========================================================
     # 4) Deploy chain
     # =========================================================
-    with TaskGroup(group_id=TG_DEPLOY) as deploy:
+    with TaskGroup(group_id=I.TG_DEPLOY) as deploy:
         snapshot_current = mk_py(
-            "snapshot_current",
+            _suffix(I.DEPLOY_SNAPSHOT),
             p.snapshot_current,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
         materialize_repo = mk_py(
-            "materialize_repo",
+            _suffix(I.DEPLOY_MATERIALIZE),
             p.triton_materialize_task,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
 
-        triton_load = mk_py("triton_load", p.triton_load_task)
-        triton_ready = mk_py("triton_ready", p.triton_ready_task)
-        triton_infer_smoke = mk_py("triton_infer_smoke", p.triton_infer_smoke_task)
+        triton_load = mk_py(_suffix(I.DEPLOY_TRITON_LOAD), p.triton_load_task)
+        triton_ready = mk_py(_suffix(I.DEPLOY_TRITON_READY), p.triton_ready_task)
+        triton_infer_smoke = mk_py(_suffix(I.DEPLOY_TRITON_SMOKE), p.triton_infer_smoke_task)
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
     # =========================================================
-    # 5) Commit (SSOT 확정 단계)
+    # 5) Commit
     # =========================================================
-    commit_current = mk_py("commit_current", p.commit_current)
+    commit_current = mk_py(I.COMMIT, p.commit_current)
 
     # =========================================================
     # 6) FastAPI reload (정책: 실패 시 자동 rollback 안함)
     # =========================================================
-    fastapi_reload = mk_py("fastapi_reload", p.fastapi_reload_task)
+    fastapi_reload = mk_py(I.FASTAPI_RELOAD, p.fastapi_reload_task)
 
     # =========================================================
-    # 7) Post-deploy Observability (Auto Rollback Trigger)
+    # 7) Post-deploy Observability
     # =========================================================
-    observe_metrics = mk_py("observe_metrics", p.observe_post_deploy_metrics)
+    observe_metrics = mk_py(I.OBSERVE, p.observe_post_deploy_metrics)
 
     # =========================================================
     # 8) Rollback (deploy/commit/observe 실패 시)
     # =========================================================
     rollback_minimal = mk_py(
-        "rollback_minimal",
+        I.ROLLBACK_MINIMAL,
         p.triton_rollback_task,
         trigger_rule=TriggerRule.ONE_FAILED,
     )
@@ -165,17 +171,18 @@ with DAG(
     promotion_start >> check_model_ready >> deploy
     shadow_start >> deploy
 
-    # ✅ 운영형 순서:
-    # deploy → commit → reload → observe
+    # 운영형 순서: deploy → commit → reload → observe
     deploy >> commit_current >> fastapi_reload >> observe_metrics
 
     # rollback policy (reload는 제외)
     [deploy, commit_current, observe_metrics] >> rollback_minimal
 
-    # summarize (always)
-    store_features >> summarize_run
-    fastapi_reload >> summarize_run
-    observe_metrics >> summarize_run
-    commit_current >> summarize_run
-    rollback_minimal >> summarize_run
-    notify_failure >> summarize_run
+    # ✅ summarize fan-in: 6줄 -> 1줄
+    [
+        store_features,
+        fastapi_reload,
+        observe_metrics,
+        commit_current,
+        rollback_minimal,
+        notify_failure,
+    ] >> summarize_run
