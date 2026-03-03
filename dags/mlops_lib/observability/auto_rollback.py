@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
+from airflow.models import Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from utils.slack_alerts import notify_info, notify_skip, notify_success
+
+from mlops_lib.core.policy import (
+    VAR_ERROR_RATE_THRESHOLD,
+    VAR_LATENCY_P95_THRESHOLD_SEC,
+)
 
 from mlops_lib.observability.prometheus_client import (
     PrometheusClient,
@@ -29,7 +35,26 @@ Auto rollback policy (SSOT)
 철학:
 - 롤백은 비용이 큰 행위 → '확실한 신호'에서만 실행
 - 관측 실패는 롤백 트리거가 아니라 "관측 인프라 문제"로 분류
+
+✅ 이번 수정의 핵심:
+- AutoRollback이 Airflow Variable(SSOT: mlops_lib.core.policy) 값을 실제로 읽어서
+  observe_error_rate_threshold / observe_latency_p95_threshold_sec를
+  롤백 임계값으로 반영한다.
 """
+
+
+def _v(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        return Variable.get(key)
+    except Exception:
+        return default
+
+
+def _to_float(raw: Optional[str], default: float) -> float:
+    try:
+        return float(str(raw))
+    except Exception:
+        return default
 
 
 @dataclass(frozen=True)
@@ -51,6 +76,28 @@ class RollbackThresholds:
     # query windows
     win_err: str = "1m"
     win_latency: str = "5m"
+
+
+def _thresholds_from_airflow_variables(defaults: RollbackThresholds) -> RollbackThresholds:
+    """
+    ✅ SSOT 연결:
+    - observe_error_rate_threshold -> max_5xx_ratio
+    - observe_latency_p95_threshold_sec -> max_p95_latency_sec
+
+    나머지(max_5xx_rps, window 등)는 "제출용 기본값"을 유지.
+    (원하면 동일 패턴으로 Variable 외부화 확장 가능)
+    """
+    max_ratio = _to_float(_v(VAR_ERROR_RATE_THRESHOLD, str(defaults.max_5xx_ratio)), defaults.max_5xx_ratio)
+    max_p95 = _to_float(_v(VAR_LATENCY_P95_THRESHOLD_SEC, str(defaults.max_p95_latency_sec)), defaults.max_p95_latency_sec)
+
+    return RollbackThresholds(
+        min_up_required=defaults.min_up_required,
+        max_5xx_ratio=max_ratio,
+        max_5xx_rps=defaults.max_5xx_rps,
+        max_p95_latency_sec=max_p95,
+        win_err=defaults.win_err,
+        win_latency=defaults.win_latency,
+    )
 
 
 @dataclass(frozen=True)
@@ -79,7 +126,11 @@ class AutoRollback:
         target: Optional[ObservabilityTarget] = None,
     ) -> None:
         self.prom = prom or PrometheusClient()
-        self.th = thresholds or RollbackThresholds()
+
+        defaults = RollbackThresholds()
+        # ✅ 외부에서 thresholds 주입하면 그걸 우선, 아니면 Variable 기반으로 로드
+        self.th = thresholds or _thresholds_from_airflow_variables(defaults)
+
         if target is None:
             # ✅ 건호님 실측 기반 "정답 라벨" 기본값
             target = ObservabilityTarget(job="fastapi-dev-service", namespace="fastapi-dev")
@@ -99,6 +150,14 @@ class AutoRollback:
         signals: Dict[str, Any] = {
             "job": self.tg.job,
             "namespace": self.tg.namespace,
+            "thresholds": {
+                "min_up_required": self.th.min_up_required,
+                "max_5xx_ratio": self.th.max_5xx_ratio,
+                "max_5xx_rps": self.th.max_5xx_rps,
+                "max_p95_latency_sec": self.th.max_p95_latency_sec,
+                "win_err": self.th.win_err,
+                "win_latency": self.th.win_latency,
+            },
         }
 
         # ---- 1) UP check
@@ -140,7 +199,10 @@ class AutoRollback:
         if float(ratio) > self.th.max_5xx_ratio and float(rps) > self.th.max_5xx_rps:
             return RollbackDecision(
                 should_rollback=True,
-                reason=f"ERROR_BUDGET_EXCEEDED: 5xx_ratio={ratio:.4f} (> {self.th.max_5xx_ratio}), 5xx_rps={rps:.3f} (> {self.th.max_5xx_rps})",
+                reason=(
+                    f"ERROR_BUDGET_EXCEEDED: 5xx_ratio={float(ratio):.6f} (> {self.th.max_5xx_ratio}), "
+                    f"5xx_rps={float(rps):.3f} (> {self.th.max_5xx_rps})"
+                ),
                 signals=signals,
             )
 
@@ -159,7 +221,7 @@ class AutoRollback:
         if float(p95) > self.th.max_p95_latency_sec:
             return RollbackDecision(
                 should_rollback=True,
-                reason=f"LATENCY_TOO_HIGH: p95={p95:.4f}s (> {self.th.max_p95_latency_sec}s)",
+                reason=f"LATENCY_TOO_HIGH: p95={float(p95):.6f}s (> {self.th.max_p95_latency_sec}s)",
                 signals=signals,
             )
 
@@ -191,6 +253,7 @@ class AutoRollback:
                 ratio=str(d.signals.get("5xx_ratio")),
                 rps=str(d.signals.get("5xx_rps")),
                 p95=str(d.signals.get("p95_latency_sec")),
+                thresholds=str(d.signals.get("thresholds")),
             )
             return True
 
@@ -212,5 +275,6 @@ class AutoRollback:
             ratio=str(d.signals.get("5xx_ratio")),
             rps=str(d.signals.get("5xx_rps")),
             p95=str(d.signals.get("p95_latency_sec")),
+            thresholds=str(d.signals.get("thresholds")),
         )
         return False
