@@ -1,4 +1,22 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Python cache / test / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Airflow / local runtime artifacts
+logs/
+tmp/
+*.log
