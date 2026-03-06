@@ -14,8 +14,10 @@ from mlops_lib.core.ids import (
     XCOM_SHADOW_REASON,
 )
 
-from mlops_lib.core.policy import (
-    Settings,
+from mlops_lib.core.policy import Settings
+
+# ✅ notify는 observability 쪽으로 이동 (core -> observability 방향 유지)
+from mlops_lib.observability.notify import (
     notify_register_completed,
     notify_shadow_reason as notify_shadow_reason_policy,
 )

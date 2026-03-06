@@ -30,8 +30,10 @@ from mlops_lib.core.ids import (
     SHADOW_REASON_DRIFT_DETECTED,
 )
 
-from mlops_lib.core.policy import (
-    Settings,
+from mlops_lib.core.policy import Settings
+
+# ✅ notify는 observability 쪽으로 이동 (core -> observability 방향 유지)
+from mlops_lib.observability.notify import (
     notify_train_completed,
     notify_branch_promotion,
     notify_branch_shadow,
@@ -96,7 +98,7 @@ def branch_by_accuracy(**context: Any) -> str:
     # 0) Drift gate 우선 (Pre-deploy quality gate)
     drift_block = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_BLOCK_PROMOTION)
     if str(drift_block).strip().lower() in ("1", "true", "yes", "y", "on"):
-        # ✅ notify_failure가 BRANCH_TASK_ID XCom을 읽으므로 branch에서 SSOT로 남김
+        # ✅ branch에서 SSOT로 남김
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_DRIFT_DETECTED)
 
         drift_reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"

@@ -9,27 +9,21 @@ from typing import Optional
 # 현재는 동작에 문제 없고, 추후 `from airflow.sdk import Variable`로 이관하면 됨.
 from airflow.models import Variable
 
-from utils.slack_alerts import notify_info, notify_skip, notify_success
-from mlops_lib.core.ids import (
-    SHADOW_REASON_TRAIN_SKIPPED,
-    SHADOW_REASON_ACCURACY_INVALID,
-    SHADOW_REASON_BELOW_THRESHOLD,
-    SHADOW_REASON_DRIFT_DETECTED,
-)
-
 """
-Policy SSOT
+Policy SSOT (Core)
 
 - DAG 정책값(재시도/timeout/센서 모드 등)
 - Triton timeouts
 - Runtime Settings (Airflow Variable 기반)
 - Drift Gate 정책(Pre-deploy quality gate)
-- Slack notify wrapper (표준 메시지 포맷)
-- Observability 정책(자동 롤백용 Prometheus settings / thresholds / promql)
+- Observability 정책(자동 롤백용 Prometheus settings / thresholds / selectors)
 
 목표:
 - DAG/파이프라인 코드에서 숫자/문자열 하드코딩 제거
 - 운영/면접에서 "정책은 한 곳에서 관리"를 증명
+
+원칙:
+- core(policy)는 외부 시스템(utils/slack, observability client 등)에 의존하지 않는다.
 """
 
 # ============================================================
@@ -98,6 +92,10 @@ VAR_OBSERVE_POKE_INTERVAL_SEC = "observe_poke_interval_sec"  # default 20
 VAR_ERROR_RATE_THRESHOLD = "observe_error_rate_threshold"  # default 0.02 (2%)
 VAR_LATENCY_P95_THRESHOLD_SEC = "observe_latency_p95_threshold_sec"  # default 0.8 (sec)
 
+# Target label selectors (job/namespace) — ✅ dev/prod 하드코딩 제거용
+VAR_OBSERVE_JOB = "observe_job"  # e.g. fastapi-dev-service / fastapi-prod-service
+VAR_OBSERVE_NAMESPACE = "observe_namespace"  # e.g. fastapi-dev / fastapi-prod
+
 # PromQL overrides (metric/label 다르면 이걸로 바꾸면 됨)
 VAR_PROMQL_ERROR_RATE = "promql_error_rate"
 VAR_PROMQL_LATENCY_P95 = "promql_latency_p95"
@@ -145,7 +143,6 @@ class Settings:
 
     - 이 값들은 "DAG 실행 중"에도 Variable로 조정 가능
     - 하지만 파이프라인 안정성을 위해, train 시작 시점에 XCom으로 고정해두는 전략을 권장
-      (현재 pipelines/full_e2e.py에서 alias/model_name을 XCom에 push하고 있음)
     """
 
     env: str
@@ -199,96 +196,3 @@ class DriftSettings:
 
 def drift_settings() -> DriftSettings:
     return DriftSettings.load()
-
-
-# ============================================================
-# Slack notify helpers (SSOT)
-# ============================================================
-
-def notify_train_completed(
-    *,
-    env: str,
-    accuracy: float,
-    alias: str,
-    run_id: str,
-    fs_version: str,
-    schema_hash: str,
-    code_version: str = "",
-) -> None:
-    notify_info(
-        "Train completed",
-        env=env,
-        accuracy=f"{float(accuracy):.4f}",
-        alias=alias,
-        run_id=run_id,
-        fs_version=fs_version,
-        schema_hash=schema_hash,
-        code_version=code_version,
-    )
-
-
-def notify_branch_promotion(*, env: str, accuracy: float, threshold: float) -> None:
-    notify_info(
-        "Branch: promotion",
-        env=env,
-        accuracy=f"{float(accuracy):.4f}",
-        threshold=str(threshold),
-    )
-
-
-def notify_branch_shadow(
-    *,
-    env: str,
-    reason: str,
-    threshold: float,
-    accuracy: Optional[float] = None,
-) -> None:
-    fields = {"env": env, "threshold": str(threshold), "reason": str(reason)}
-    if accuracy is not None:
-        fields["accuracy"] = f"{float(accuracy):.4f}"
-    notify_info("Branch: shadow", **fields)
-
-
-def notify_register_completed(*, env: str, model: str, alias: str, version: int) -> None:
-    notify_success(
-        "MLflow register+alias completed",
-        env=env,
-        model=model,
-        alias=alias,
-        version=str(int(version)),
-    )
-
-
-def notify_shadow_reason(*, env: str, reason: Optional[str]) -> None:
-    """
-    Shadow로 빠진 이유(SSOT) 기준으로 Slack 메시지를 표준화합니다.
-    """
-    title = "Shadow path selected"
-
-    if reason == SHADOW_REASON_TRAIN_SKIPPED:
-        notify_skip(title, env=env, reason="train skipped", next_action="데이터/피처/라벨 조건 확인")
-        return
-
-    if reason == SHADOW_REASON_ACCURACY_INVALID:
-        notify_skip(title, env=env, reason="accuracy invalid", next_action="train task의 accuracy 산출/형 변환 확인")
-        return
-
-    if reason == SHADOW_REASON_DRIFT_DETECTED:
-        notify_skip(
-            title,
-            env=env,
-            reason="drift detected (pre-deploy gate)",
-            next_action="feature contract / schema / data shift 확인",
-        )
-        return
-
-    # default: below threshold
-    if reason is None:
-        reason = SHADOW_REASON_BELOW_THRESHOLD
-
-    notify_skip(
-        title,
-        env=env,
-        reason="accuracy below threshold",
-        next_action="feature/label/model 개선 후 재시도",
-    )

@@ -12,6 +12,8 @@ from utils.slack_alerts import notify_info, notify_skip, notify_success
 from mlops_lib.core.policy import (
     VAR_ERROR_RATE_THRESHOLD,
     VAR_LATENCY_P95_THRESHOLD_SEC,
+    VAR_OBSERVE_JOB,
+    VAR_OBSERVE_NAMESPACE,
 )
 
 from mlops_lib.observability.prometheus_client import (
@@ -36,10 +38,10 @@ Auto rollback policy (SSOT)
 - 롤백은 비용이 큰 행위 → '확실한 신호'에서만 실행
 - 관측 실패는 롤백 트리거가 아니라 "관측 인프라 문제"로 분류
 
-✅ 이번 수정의 핵심:
-- AutoRollback이 Airflow Variable(SSOT: mlops_lib.core.policy) 값을 실제로 읽어서
-  observe_error_rate_threshold / observe_latency_p95_threshold_sec를
-  롤백 임계값으로 반영한다.
+✅ SSOT 연결:
+- observe_error_rate_threshold -> max_5xx_ratio
+- observe_latency_p95_threshold_sec -> max_p95_latency_sec
+- observe_job / observe_namespace -> Prometheus label selectors
 """
 
 
@@ -79,14 +81,6 @@ class RollbackThresholds:
 
 
 def _thresholds_from_airflow_variables(defaults: RollbackThresholds) -> RollbackThresholds:
-    """
-    ✅ SSOT 연결:
-    - observe_error_rate_threshold -> max_5xx_ratio
-    - observe_latency_p95_threshold_sec -> max_p95_latency_sec
-
-    나머지(max_5xx_rps, window 등)는 "제출용 기본값"을 유지.
-    (원하면 동일 패턴으로 Variable 외부화 확장 가능)
-    """
     max_ratio = _to_float(_v(VAR_ERROR_RATE_THRESHOLD, str(defaults.max_5xx_ratio)), defaults.max_5xx_ratio)
     max_p95 = _to_float(_v(VAR_LATENCY_P95_THRESHOLD_SEC, str(defaults.max_p95_latency_sec)), defaults.max_p95_latency_sec)
 
@@ -104,10 +98,16 @@ def _thresholds_from_airflow_variables(defaults: RollbackThresholds) -> Rollback
 class ObservabilityTarget:
     """
     Prometheus label selectors (SSOT)
-    - 지금 건호님 환경에서 확정된 값 기준
     """
     job: str
     namespace: str
+
+
+def _target_from_airflow_variables() -> ObservabilityTarget:
+    # ✅ dev/prod 하드코딩 제거: Variable로 주입
+    job = (_v(VAR_OBSERVE_JOB, "fastapi-dev-service") or "fastapi-dev-service").strip()
+    ns = (_v(VAR_OBSERVE_NAMESPACE, "fastapi-dev") or "fastapi-dev").strip()
+    return ObservabilityTarget(job=job, namespace=ns)
 
 
 @dataclass(frozen=True)
@@ -128,25 +128,14 @@ class AutoRollback:
         self.prom = prom or PrometheusClient()
 
         defaults = RollbackThresholds()
-        # ✅ 외부에서 thresholds 주입하면 그걸 우선, 아니면 Variable 기반으로 로드
         self.th = thresholds or _thresholds_from_airflow_variables(defaults)
 
-        if target is None:
-            # ✅ 건호님 실측 기반 "정답 라벨" 기본값
-            target = ObservabilityTarget(job="fastapi-dev-service", namespace="fastapi-dev")
-        self.tg = target
+        self.tg = target or _target_from_airflow_variables()
 
     # ---------------------------
     # Core evaluation
     # ---------------------------
     def evaluate(self) -> RollbackDecision:
-        """
-        관측 기반 판단:
-        1) up(min) < 1 -> rollback
-        2) 5xx_ratio > threshold AND (5xx_rps > threshold) -> rollback (오탐 방지)
-        3) p95 latency > threshold -> rollback (지속 느림)
-        관측값이 없으면 "판정 보류" (rollback False) + reason에 남김
-        """
         signals: Dict[str, Any] = {
             "job": self.tg.job,
             "namespace": self.tg.namespace,
@@ -165,7 +154,6 @@ class AutoRollback:
         signals["min_up"] = min_up
 
         if min_up is None:
-            # 관측 불가 = 롤백 근거로 쓰지 않음(오탐 방지)
             return RollbackDecision(
                 should_rollback=False,
                 reason="OBSERVABILITY_UNAVAILABLE: up metric missing",
@@ -189,7 +177,6 @@ class AutoRollback:
         signals["5xx_rps"] = rps
 
         if ratio is None or rps is None:
-            # 일부 신호만 없을 때도 롤백 금지(오탐 방지)
             return RollbackDecision(
                 should_rollback=False,
                 reason="OBSERVABILITY_PARTIAL: 5xx metrics missing",
@@ -235,14 +222,8 @@ class AutoRollback:
     # Airflow-friendly callables
     # ---------------------------
     def task_decide(self, **context: Any) -> bool:
-        """
-        Airflow PythonOperator에서 호출:
-        - True면 'rollback 경로'로 branch/trigger 할 수 있음
-        - False면 정상 진행
-        """
         d = self.evaluate()
 
-        # Slack 메시지 표준화
         if d.should_rollback:
             notify_info(
                 "AutoRollback: TRIGGERED",
