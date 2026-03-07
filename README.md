@@ -20,7 +20,7 @@
 
 이 플랫폼은 이러한 리스크를 통제하기 위해 다음을 구현합니다:
 
-- Accuracy 기반 Promotion / Shadow 분기
+- Accuracy + Drift Gate 기반 Promotion / Shadow 분기
 - Drift Gate 사전 차단
 - Sensor 기반 Ready 검증
 - Smoke Test 기반 배포 검증
@@ -100,7 +100,7 @@ Data → Feature → Train → Branch
 ↓
 (Promotion) → Register → Ready Sensor → Deploy → Smoke → Commit → Reload → Observe
 ↓
-(Shadow) → Deploy(shadow) → Reload
+(Shadow) → Deploy(shadow) → Observe
 ↓
 Failure → Minimal Rollback
 ```
