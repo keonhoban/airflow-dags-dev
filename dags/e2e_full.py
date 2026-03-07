@@ -142,14 +142,22 @@ with DAG(
     commit_current = mk_py(I.COMMIT, p.commit_current)
 
     # =========================================================
-    # 6) FastAPI reload (정책: 실패 시 자동 rollback 안함)
+    # 6) FastAPI reload
+    # 정책:
+    # - promotion: 실행
+    # - shadow: p_reload.py 내부 정책으로 skip
     # =========================================================
     fastapi_reload = mk_py(I.FASTAPI_RELOAD, p.fastapi_reload_task)
 
     # =========================================================
     # 7) Post-deploy Observability
+    # shadow에서는 fastapi_reload가 skipped 되어도 observe는 계속 진행
     # =========================================================
-    observe_metrics = mk_py(I.OBSERVE, p.observe_post_deploy_metrics)
+    observe_metrics = mk_py(
+        I.OBSERVE,
+        p.observe_post_deploy_metrics,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
 
     # =========================================================
     # 8) Rollback (deploy/commit/observe 실패 시)
@@ -171,13 +179,15 @@ with DAG(
     promotion_start >> check_model_ready >> deploy
     shadow_start >> deploy
 
-    # 운영형 순서: deploy → commit → reload → observe
+    # 운영형 순서:
+    # - promotion: deploy -> commit -> reload -> observe
+    # - shadow: deploy -> commit -> (reload skipped) -> observe
     deploy >> commit_current >> fastapi_reload >> observe_metrics
 
     # rollback policy (reload는 제외)
     [deploy, commit_current, observe_metrics] >> rollback_minimal
 
-    # ✅ summarize fan-in: 6줄 -> 1줄
+    # summarize fan-in
     [
         store_features,
         fastapi_reload,
