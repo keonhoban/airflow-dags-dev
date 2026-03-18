@@ -3,12 +3,12 @@ from __future__ import annotations
 import io
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional, Sequence
 
 import pandas as pd
 from airflow.utils.log.logging_mixin import LoggingMixin
 from jinja2 import Template
 
+from ml_code.triton_xcom import xcom_pull_any
 from .s3 import get_s3_client, parse_s3_uri
 
 logger = LoggingMixin().log
@@ -29,15 +29,6 @@ def _read_local_text(path: str) -> str:
         return f.read()
 
 
-def _xcom_pull_any(ti, *, key: str, task_ids: Sequence[str]) -> Optional[Any]:
-    """TaskGroup(dp.) 유무에 상관없이 XCom을 안전하게 pull."""
-    for tid in task_ids:
-        v = ti.xcom_pull(key=key, task_ids=tid)
-        if v is not None:
-            return v
-    return None
-
-
 def store_features(feature_base: str, pipeline_name: str, feature_set: str, metadata_tpl_path: str, ti) -> None:
     s3 = get_s3_client()
 
@@ -45,13 +36,13 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     BUILD_TASKS = ("dp.build_features", "build_features")
     EXTRACT_TASKS = ("dp.extract_raw_data", "extract_raw_data")
 
-    schema = _xcom_pull_any(ti, key="fs_schema", task_ids=BUILD_TASKS)
-    schema_hash = _xcom_pull_any(ti, key="fs_schema_hash", task_ids=BUILD_TASKS)
-    features_csv_uri = _xcom_pull_any(ti, key="fs_features_csv_uri", task_ids=BUILD_TASKS)
-    rows = _xcom_pull_any(ti, key="fs_feature_rows", task_ids=BUILD_TASKS)
+    schema = xcom_pull_any(ti, key="fs_schema", task_ids=BUILD_TASKS)
+    schema_hash = xcom_pull_any(ti, key="fs_schema_hash", task_ids=BUILD_TASKS)
+    features_csv_uri = xcom_pull_any(ti, key="fs_features_csv_uri", task_ids=BUILD_TASKS)
+    rows = xcom_pull_any(ti, key="fs_feature_rows", task_ids=BUILD_TASKS)
 
     # dp_raw_path는 extract 단계에서 나오는 게 정상이므로 extract에서 우선 pull
-    source_raw = _xcom_pull_any(ti, key="dp_raw_path", task_ids=EXTRACT_TASKS)
+    source_raw = xcom_pull_any(ti, key="dp_raw_path", task_ids=EXTRACT_TASKS)
 
     if not features_csv_uri:
         raise ValueError("fs_features_csv_uri missing — build_features가 staging 경로를 push하지 않았습니다")

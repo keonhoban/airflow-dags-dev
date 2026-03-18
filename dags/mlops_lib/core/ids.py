@@ -166,3 +166,27 @@ class E2E:
     FASTAPI_RELOAD = FASTAPI_RELOAD_TASK_ID
     OBSERVE = OBSERVE_METRICS_TASK_ID
     ROLLBACK_MINIMAL = ROLLBACK_MINIMAL_TASK_ID
+
+    # ----------------------------------------------------------
+    # TaskGroup 내부 task_id (suffix only)
+    #
+    # TaskGroup 안에서 task_id를 등록할 때는 group prefix 없이
+    # suffix만 전달해야 한다. Airflow가 자동으로 prefix를 붙여
+    # 최종 task_id = "{group_id}.{suffix}" 가 된다.
+    #
+    # 전체 경로(DP_EXTRACT 등)와 1:1로 대응하므로,
+    # 새 task_id 추가 시 전체 경로와 suffix 양쪽을 함께 정의한다.
+    # ----------------------------------------------------------
+
+    # dp TaskGroup suffixes
+    DP_EXTRACT_S = "extract_raw_data"
+    DP_VALIDATE_S = "validate_data"
+    DP_BUILD_S = "build_features"
+    DP_STORE_S = "store_features"
+
+    # deploy TaskGroup suffixes
+    DEPLOY_SNAPSHOT_S = "snapshot_current"
+    DEPLOY_MATERIALIZE_S = "materialize_repo"
+    DEPLOY_TRITON_LOAD_S = "triton_load"
+    DEPLOY_TRITON_READY_S = "triton_ready"
+    DEPLOY_TRITON_SMOKE_S = "triton_infer_smoke"

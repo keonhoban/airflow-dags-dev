@@ -38,14 +38,6 @@ DEFAULT_ARGS = {
 }
 
 
-def _suffix(task_id: str) -> str:
-    """
-    TaskGroup 내부 task_id는 group prefix 없이 들어가야 해서 suffix만 사용.
-    ex) "dp.store_features" -> "store_features"
-    """
-    return task_id.split(".", 1)[1] if "." in task_id else task_id
-
-
 def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> PythonOperator:
     return PythonOperator(
         task_id=task_id,
@@ -57,6 +49,11 @@ def mk_py(task_id: str, fn, *, trigger_rule: str = TriggerRule.ALL_SUCCESS) -> P
 with DAG(
     dag_id=I.DAG_ID,
     default_args=DEFAULT_ARGS,
+    # schedule=None: 수동 트리거 전용 DAG.
+    # 이유: dp_feature_pipeline(upstream)의 완료 시점이 데이터 볼륨에 따라 가변적이므로
+    #       cron으로 고정하면 race condition이 발생할 수 있다.
+    #       운영 환경에서는 dp_feature_pipeline의 on_success_callback 또는
+    #       Airflow Dataset 트리거로 연결한다(mlops-infra-gitops 참고).
     schedule=None,
     catchup=False,
     max_active_runs=E2E_MAX_ACTIVE_RUNS,
@@ -69,10 +66,10 @@ with DAG(
     # 1) Data Pipeline
     # =========================================================
     with TaskGroup(group_id=I.TG_DP) as dp:
-        extract_raw_data = mk_py(_suffix(I.DP_EXTRACT), p.dp_extract)
-        validate_data = mk_py(_suffix(I.DP_VALIDATE), p.dp_validate)
-        build_features = mk_py(_suffix(I.DP_BUILD), p.dp_build)
-        store_features = mk_py(_suffix(I.DP_STORE), p.dp_store)
+        extract_raw_data = mk_py(I.DP_EXTRACT_S, p.dp_extract)
+        validate_data = mk_py(I.DP_VALIDATE_S, p.dp_validate)
+        build_features = mk_py(I.DP_BUILD_S, p.dp_build)
+        store_features = mk_py(I.DP_STORE_S, p.dp_store)
 
         extract_raw_data >> validate_data >> build_features >> store_features
 
@@ -120,19 +117,19 @@ with DAG(
     # =========================================================
     with TaskGroup(group_id=I.TG_DEPLOY) as deploy:
         snapshot_current = mk_py(
-            _suffix(I.DEPLOY_SNAPSHOT),
+            I.DEPLOY_SNAPSHOT_S,
             p.snapshot_current,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
         materialize_repo = mk_py(
-            _suffix(I.DEPLOY_MATERIALIZE),
+            I.DEPLOY_MATERIALIZE_S,
             p.triton_materialize_task,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
 
-        triton_load = mk_py(_suffix(I.DEPLOY_TRITON_LOAD), p.triton_load_task)
-        triton_ready = mk_py(_suffix(I.DEPLOY_TRITON_READY), p.triton_ready_task)
-        triton_infer_smoke = mk_py(_suffix(I.DEPLOY_TRITON_SMOKE), p.triton_infer_smoke_task)
+        triton_load = mk_py(I.DEPLOY_TRITON_LOAD_S, p.triton_load_task)
+        triton_ready = mk_py(I.DEPLOY_TRITON_READY_S, p.triton_ready_task)
+        triton_infer_smoke = mk_py(I.DEPLOY_TRITON_SMOKE_S, p.triton_infer_smoke_task)
 
         snapshot_current >> materialize_repo >> triton_load >> triton_ready >> triton_infer_smoke
 
