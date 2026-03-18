@@ -1,8 +1,9 @@
 # dags/mlops_lib/core/policy.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 # NOTE:
 # Airflow 2.10+ / 3.x 계열에서 `airflow.models.Variable` 경고가 뜰 수 있음.
@@ -35,6 +36,9 @@ E2E_RETRIES = 1
 E2E_RETRY_DELAY_MIN = 2
 E2E_MAX_ACTIVE_RUNS = 1
 E2E_DAGRUN_TIMEOUT_MIN = 30
+# SLA: 트리거 후 이 시간 안에 DAG가 완료되지 않으면 sla_miss_callback 호출.
+# dagrun_timeout(30분)보다 크게 설정해야 의미가 있음.
+E2E_SLA_HOUR = 1
 
 MODEL_READY_POKE_INTERVAL_SEC = 10
 MODEL_READY_TIMEOUT_SEC = 180
@@ -106,11 +110,47 @@ VAR_PROMQL_ERROR_RATE = "promql_error_rate"
 VAR_PROMQL_LATENCY_P95 = "promql_latency_p95"
 
 
-def _v(key: str, default: Optional[str] = None) -> Optional[str]:
+def _non_empty(v: Any) -> Optional[str]:
+    """빈 문자열과 None을 동일하게 처리. str.strip() 후 비어있으면 None 반환."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def get_var(key: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
+    """
+    SSOT 설정 조회 — policy.py와 ml_code/config.py가 공유하는 단일 구현.
+
+    우선순위:
+      1) 환경변수 (os.getenv)
+      2) Airflow Variable
+      3) default
+
+    Args:
+        key      : 환경변수명 / Airflow Variable key (동일 값 사용)
+        default  : 위 1-2가 모두 없을 때 반환할 값
+        required : True면 최종적으로 값이 없을 때 RuntimeError 발생
+    """
+    v = _non_empty(os.getenv(key))
+    if v is not None:
+        return v
+
     try:
-        return Variable.get(key)
+        raw = Variable.get(key, default_var=str(default) if default is not None else None)
+        v = _non_empty(raw)
+        if v is not None:
+            return v
     except Exception:
-        return default
+        pass
+
+    if required:
+        raise RuntimeError(f"[Config] missing required key: {key!r}")
+    return default
+
+
+# 파일 내부 호출용 alias — 기존 _v() 호출부를 일괄 교체 없이 유지
+_v = get_var
 
 
 def _to_float(raw: Optional[str], default: float) -> float:

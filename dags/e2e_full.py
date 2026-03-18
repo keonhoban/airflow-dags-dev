@@ -13,7 +13,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 from pipelines import full_e2e as p
-from utils.slack_alerts import alert_slack
+from utils.slack_alerts import alert_slack, alert_sla_miss
 
 # ✅ Import 압축: DAG는 E2E alias만 봄
 from mlops_lib.core.ids import E2E as I
@@ -24,6 +24,7 @@ from mlops_lib.core.policy import (
     E2E_RETRY_DELAY_MIN,
     E2E_MAX_ACTIVE_RUNS,
     E2E_DAGRUN_TIMEOUT_MIN,
+    E2E_SLA_HOUR,
     MODEL_READY_POKE_INTERVAL_SEC,
     MODEL_READY_TIMEOUT_SEC,
     MODEL_READY_MODE,
@@ -35,6 +36,9 @@ DEFAULT_ARGS = {
     "start_date": datetime(*E2E_START_DATE_YMD, tzinfo=kst),
     "retries": E2E_RETRIES,
     "retry_delay": timedelta(minutes=E2E_RETRY_DELAY_MIN),
+    # SLA: 태스크 단위. 트리거 기준으로 E2E_SLA_HOUR 내에 완료되지 않으면
+    # DAG 레벨 sla_miss_callback(alert_sla_miss)이 호출된다.
+    "sla": timedelta(hours=E2E_SLA_HOUR),
 }
 
 
@@ -59,6 +63,7 @@ with DAG(
     max_active_runs=E2E_MAX_ACTIVE_RUNS,
     tags=["e2e", "mlops", "triton", "mlflow"],
     on_failure_callback=alert_slack,
+    sla_miss_callback=alert_sla_miss,
     dagrun_timeout=timedelta(minutes=E2E_DAGRUN_TIMEOUT_MIN),
 ) as dag:
 
@@ -184,12 +189,15 @@ with DAG(
     # rollback policy (reload는 제외)
     [deploy, commit_current, observe_metrics] >> rollback_minimal
 
-    # summarize fan-in
+    # summarize fan-in: 실제 terminal 태스크만 연결한다.
+    # - fastapi_reload  : promotion의 마지막 I/O 태스크 (shadow는 skip됨)
+    # - observe_metrics : 파이프라인 최종 품질 판정
+    # - rollback_minimal: 장애 복구 경로의 끝
+    # - notify_failure  : shadow 분기 알림의 끝
+    # (store_features는 초반 dp 태스크이므로 제외)
     [
-        store_features,
         fastapi_reload,
         observe_metrics,
-        commit_current,
         rollback_minimal,
         notify_failure,
     ] >> summarize_run

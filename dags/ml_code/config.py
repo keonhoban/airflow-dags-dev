@@ -1,12 +1,12 @@
 # dags/ml_code/config.py
 from __future__ import annotations
 
-import os
-from typing import Any, Optional
+from typing import Any
 
 import mlflow
-from airflow.models import Variable
 from mlflow.tracking import MlflowClient
+
+from mlops_lib.core.policy import get_var as _get_var
 
 # -----------------------
 # Key SSOT (면접/운영 설명용 고정)
@@ -29,42 +29,15 @@ K_FASTAPI_RELOAD_TIMEOUT_VAR = "fastapi_reload_timeout"
 DEFAULT_FASTAPI_RELOAD_TIMEOUT = 10
 
 
-def _non_empty(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s else None
-
-
 def cfg(key: str, default: Any = None, *, required: bool = False) -> Any:
     """
-    Config precedence:
-      1) env var (key)
-      2) Airflow Variable (same key)
-      3) default
+    Config precedence: env var → Airflow Variable → default.
 
-    NOTE:
-      - 운영에서는 Secret/env 주입이 정석
-      - Variable fallback은 로컬/실습 편의용
+    구현은 mlops_lib.core.policy.get_var에 위임.
+    ml_code 전체에서 이 함수를 통해 설정을 읽으므로 이름은 유지한다.
     """
-    v = _non_empty(os.getenv(key))
-    if v is not None:
-        return v
-
-    try:
-        if default is None:
-            v = Variable.get(key)
-        else:
-            v = Variable.get(key, default_var=str(default))
-        v = _non_empty(v)
-        if v is not None:
-            return v
-    except Exception:
-        pass
-
-    if required:
-        raise RuntimeError(f"[Config] missing required key: {key}")
-    return default
+    str_default = str(default) if default is not None else None
+    return _get_var(key, str_default, required=required)
 
 
 def cfg_int(key: str, default: int, *, required: bool = False) -> int:

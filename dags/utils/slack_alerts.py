@@ -119,6 +119,37 @@ def notify_fail(title: str, **fields: Any) -> bool:
 # -----------------------
 # airflow callback (SSOT)
 # -----------------------
+def alert_sla_miss(dag, task_list, blocking_task_list, slas, blocking_tis) -> None:
+    """
+    Airflow sla_miss_callback 용.
+
+    SLA를 초과한 태스크가 발생하면 Slack에 경고를 보낸다.
+    콜백 실패가 DAG 실행에 영향을 주지 않도록 예외를 억제한다.
+
+    파라미터 (Airflow 2.x 고정 시그니처):
+        dag              : DAG 객체
+        task_list        : SLA를 초과한 task_id 목록 문자열
+        blocking_task_list: 완료를 막고 있는 task_id 목록 문자열
+        slas             : SlaMiss 객체 목록
+        blocking_tis     : 차단 중인 TaskInstance 목록
+    """
+    try:
+        dag_id = getattr(dag, "dag_id", "-")
+        base_url = _get_env("AIRFLOW__WEBSERVER__WEB_SERVER_BASE_URL").rstrip("/")
+        dag_url = f"{base_url}/dags/{dag_id}/grid" if base_url else "-"
+
+        notify(
+            "⏰ SLA MISS",
+            "E2E pipeline exceeded SLA",
+            dag=dag_id,
+            missed_tasks=_truncate(task_list),
+            blocking_tasks=_truncate(blocking_task_list),
+            dag_view=dag_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("alert_sla_miss: failed to send Slack notification: %s", exc)
+
+
 def alert_slack(context: Dict[str, Any]) -> None:
     """
     Airflow on_failure_callback 용.
