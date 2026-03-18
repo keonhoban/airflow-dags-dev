@@ -1,0 +1,55 @@
+# ============================================================
+# airflow-dags-dev dependencies
+# ============================================================
+# 이 파일은 코드베이스에서 실제 import되는 서드파티 패키지를 기준으로 작성됩니다.
+# Airflow 자체와 provider는 인프라 레포(mlops-infra-gitops)의 이미지 빌드에서 관리하되,
+# 로컬 개발 / CI 테스트를 위해 하한 버전을 명시합니다.
+#
+# 로컬 설치:
+#   pip install -r requirements.txt
+#
+# CI (DAG integrity test):
+#   pip install -r requirements.txt
+#   pytest tests/
+
+# ============================================================
+# Airflow core & providers
+# ============================================================
+apache-airflow>=2.10.0,<3.0
+apache-airflow-providers-cncf-kubernetes>=8.0.0   # feast_materialize.py - KubernetesPodOperator
+
+# ============================================================
+# ML — 학습 / 모델 등록 / ONNX 변환
+# ============================================================
+# train_model.py, register_model.py, triton_actions.py
+mlflow>=2.14.0
+scikit-learn>=1.4.0
+skl2onnx>=1.17.0
+onnx>=1.16.0                                       # skl2onnx 런타임 의존성
+
+# ============================================================
+# 데이터 처리
+# ============================================================
+# build.py, store.py, drift_gate.py, train_model.py
+pandas>=2.1.0
+numpy>=1.26.0
+pyarrow>=15.0.0                                    # pandas.DataFrame.to_parquet() 백엔드
+
+# ============================================================
+# 클라우드 / 스토리지
+# ============================================================
+# s3.py, train_model.py — S3 (AWS or MinIO)
+boto3>=1.34.0
+
+# ============================================================
+# HTTP / 유틸리티
+# ============================================================
+# infra/http.py, slack_alerts.py, prometheus_client.py
+requests>=2.31.0
+jinja2>=3.1.0                                      # store.py - metadata template 렌더링
+pendulum>=3.0.0                                    # e2e_full.py, feast_materialize.py - timezone
+
+# ============================================================
+# 테스트 (개발용)
+# ============================================================
+pytest>=8.0.0

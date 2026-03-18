@@ -75,6 +75,11 @@ VAR_DRIFT_SAMPLE_N = "drift_sample_n"  # default 2000
 VAR_DRIFT_MAX_COLS = "drift_max_columns"  # default 20
 
 # ============================================================
+# Data Pipeline (SSOT)
+# ============================================================
+VAR_DP_MIN_ROWS = "dp_min_rows"  # default 50 — 학습 의미가 있는 최소 피처 행 수
+
+# ============================================================
 # Observability / Auto Rollback (SSOT)
 # ============================================================
 

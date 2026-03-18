@@ -47,14 +47,20 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
 
     schema = _xcom_pull_any(ti, key="fs_schema", task_ids=BUILD_TASKS)
     schema_hash = _xcom_pull_any(ti, key="fs_schema_hash", task_ids=BUILD_TASKS)
-    features_csv = _xcom_pull_any(ti, key="fs_features_csv", task_ids=BUILD_TASKS)
+    features_csv_uri = _xcom_pull_any(ti, key="fs_features_csv_uri", task_ids=BUILD_TASKS)
     rows = _xcom_pull_any(ti, key="fs_feature_rows", task_ids=BUILD_TASKS)
 
     # dp_raw_path는 extract 단계에서 나오는 게 정상이므로 extract에서 우선 pull
     source_raw = _xcom_pull_any(ti, key="dp_raw_path", task_ids=EXTRACT_TASKS)
 
-    if not features_csv:
-        raise ValueError("features_csv missing")
+    if not features_csv_uri:
+        raise ValueError("fs_features_csv_uri missing — build_features가 staging 경로를 push하지 않았습니다")
+
+    # XCom에는 URI만 전달 — 실제 CSV는 S3 staging에서 읽는다
+    stg_bkt, stg_key = parse_s3_uri(features_csv_uri)
+    stg_obj = s3.get_object(Bucket=stg_bkt, Key=stg_key)
+    features_csv = stg_obj["Body"].read().decode("utf-8")
+    logger.info("[FS] staging CSV loaded uri=%s", features_csv_uri)
 
     exec_date = getattr(ti, "execution_date", None)
     ver = _version_id(exec_date)

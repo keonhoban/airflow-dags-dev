@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io, csv
 from datetime import datetime, timezone, timedelta
+from airflow.models import Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 
+from mlops_lib.core.policy import VAR_DP_MIN_ROWS
 from .s3 import get_s3_client, parse_s3_uri
 from .feature_schema import load_schema
 
@@ -11,7 +13,7 @@ logger = LoggingMixin().log
 KST = timezone(timedelta(hours=9))
 
 
-def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_path: str, ti) -> None:
+def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_path: str, feature_base: str, ti) -> None:
     schema, schema_hash = load_schema(schema_path, expected_feature_set=feature_set)
     cols = [c["name"] for c in schema["columns"]]
 
@@ -118,7 +120,7 @@ def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_p
         label_counts[row["label"]] = label_counts.get(row["label"], 0) + 1
 
     # 최소 조건(데모/운영 기준으로 권장)
-    min_rows = int(ti.xcom_pull(key="dp_min_rows", task_ids=None) or 50)  # Variable로 바꾸고 싶으면 이후에
+    min_rows = int(Variable.get(VAR_DP_MIN_ROWS, default_var=50))
     min_classes = 2
 
     uniq_labels = sorted(label_counts.keys())
@@ -146,10 +148,20 @@ def build_features(raw_path: str, pipeline_name: str, feature_set: str, schema_p
     w = csv.writer(buf)
     w.writerow(cols)
     w.writerows(feature_rows)
+    csv_bytes = buf.getvalue().encode("utf-8")
+
+    # CSV를 S3 staging 경로에 직접 쓰고 URI만 XCom에 전달.
+    # XCom은 메타데이터(URI, 수치) 전용 — 대용량 바이트를 MetadataDB에 저장하지 않는다.
+    bkt, base_prefix = parse_s3_uri(feature_base)
+    staging_key = f"{base_prefix.rstrip('/')}/{pipeline_name}/staging/features.csv"
+    staging_uri = f"s3://{bkt}/{staging_key}"
+
+    s3.put_object(Bucket=bkt, Key=staging_key, Body=csv_bytes, ContentType="text/csv")
+    logger.info("[FS] staging CSV written uri=%s bytes=%d", staging_uri, len(csv_bytes))
 
     ti.xcom_push(key="fs_schema", value=schema)
     ti.xcom_push(key="fs_schema_hash", value=schema_hash)
-    ti.xcom_push(key="fs_features_csv", value=buf.getvalue())
+    ti.xcom_push(key="fs_features_csv_uri", value=staging_uri)
     ti.xcom_push(key="fs_feature_rows", value=n_rows)
     ti.xcom_push(key="dp_raw_path", value=raw_path)
 

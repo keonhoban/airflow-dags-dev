@@ -47,6 +47,7 @@ def task_build_features(**context):
         pipeline_name=cfg.pipeline_name,
         feature_set=cfg.feature_set,
         schema_path=cfg.schema_path,
+        feature_base=cfg.feature_base,
         ti=ti,
     )
 
