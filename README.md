@@ -8,6 +8,76 @@
 
 ---
 
+# 0. System Architecture
+
+두 레포(`airflow-dags-dev` + `mlops-infra-gitops`)가 협력하여 구성하는 전체 시스템입니다.
+
+```mermaid
+flowchart TD
+    subgraph repo1["📦 airflow-dags-dev (DAG Orchestration)"]
+        direction TB
+        DAG["e2e_full DAG\n(Orchestration Only)"]
+        DP["dp TaskGroup\nextract → validate\n→ build → store"]
+        DG["drift_gate\nKS-stat D > 0.20?"]
+        TRAIN["train_and_evaluate\nLogisticRegression + ONNX export"]
+        BRANCH["branch_by_accuracy\n(BranchPythonOperator)"]
+        PROMO["Promotion Path\nregister → sensor → deploy\n→ commit → reload"]
+        SHADOW["Shadow Path\ndeploy only\n(commit/reload skipped)"]
+        OBS["observe_post_deploy_metrics\nPrometheus query"]
+        RB["rollback_minimal\ncurrent.json restore\n+ quarantine + Triton reload"]
+
+        DAG --> DP
+        DP -->|"feature batch\n(S3 URI via XCom)"| DG
+        DG -->|"drift OK"| TRAIN
+        DG -->|"drift detected\n→ force shadow"| SHADOW
+        TRAIN --> BRANCH
+        BRANCH -->|"accuracy ≥ threshold\n+ drift OK"| PROMO
+        BRANCH -->|"accuracy < threshold\nor train failed"| SHADOW
+        PROMO -->|"deploy_mode=promote"| OBS
+        SHADOW -->|"deploy_mode=shadow"| OBS
+        OBS -->|"metric anomaly\nor SLO breach"| RB
+        PROMO -->|"smoke test fail\nor commit fail"| RB
+    end
+
+    subgraph repo2["⚙️ mlops-infra-gitops (K8s Infrastructure)"]
+        direction TB
+        ARGOCD["ArgoCD\n(GitOps sync)"]
+        TRITON["Triton Inference Server\n(ONNX model serving)"]
+        FASTAPI["FastAPI\n(variant routing\npromotion / shadow)"]
+        PROM["Prometheus\n(metrics scrape)"]
+        K8S["Kubernetes\n(pod lifecycle)"]
+
+        ARGOCD -->|"K8s manifest apply"| K8S
+        K8S -->|"pod scheduling"| TRITON
+        K8S -->|"pod scheduling"| FASTAPI
+        FASTAPI -->|"inference request\n/v2/models/{model}/infer"| TRITON
+        TRITON -->|"prediction response"| FASTAPI
+        FASTAPI -->|"expose metrics\n/metrics"| PROM
+    end
+
+    subgraph stores["🗄️ Shared State"]
+        S3["S3\n(feature store\n+ ONNX artifacts\n+ current.json)"]
+        MLFLOW["MLflow Registry\n(model version\n+ alias + run_id)"]
+    end
+
+    %% Cross-repo flows
+    DP -->|"store features\n+ reference dist"| S3
+    PROMO -->|"register version\n+ set alias"| MLFLOW
+    PROMO -->|"materialize ONNX\nto Triton repo"| S3
+    SHADOW -->|"materialize ONNX\nto shadow repo"| S3
+    MLFLOW -->|"alias lookup\n(select_by_alias)"| PROMO
+    S3 -->|"ONNX artifact\ndownload"| TRITON
+    PROM -->|"query window\n(60s)"| OBS
+    RB -->|"restore snapshot\nfrom S3"| S3
+    RB -->|"Triton unload\n→ load prev version"| TRITON
+```
+
+> **레포 역할 분리**: `airflow-dags-dev`는 파이프라인 로직과 배포 정책을 소유합니다.
+> `mlops-infra-gitops`는 인프라 선언(Helm values, K8s manifests)을 소유합니다.
+> 두 레포는 S3 / MLflow Registry / Triton HTTP API를 통해서만 결합됩니다.
+
+---
+
 # 1. What Problem This Solves
 
 운영 환경에서 모델 교체는 다음과 같은 리스크를 가집니다:

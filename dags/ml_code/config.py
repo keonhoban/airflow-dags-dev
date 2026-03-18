@@ -103,6 +103,21 @@ def get_experiment_name() -> str:
 # -----------------------
 # Exported SSOT constants
 # -----------------------
-T_FASTAPI_RELOAD = cfg_int(K_FASTAPI_RELOAD_TIMEOUT_ENV, DEFAULT_FASTAPI_RELOAD_TIMEOUT, required=False)
-# env가 없으면 Variable도 허용(실습/운영 유연성)
-T_FASTAPI_RELOAD = cfg_int(K_FASTAPI_RELOAD_TIMEOUT_VAR, T_FASTAPI_RELOAD, required=False)
+
+def _load_fastapi_reload_timeout() -> int:
+    """
+    FastAPI reload timeout 해소 우선순위 (단일 경로):
+      1) env FASTAPI_RELOAD_TIMEOUT   (대문자 — 운영 env 주입 정석)
+      2) Variable fastapi_reload_timeout (소문자 — Airflow Variable 컨벤션)
+      3) DEFAULT_FASTAPI_RELOAD_TIMEOUT (= 10)
+
+    두 키가 네이밍 컨벤션(대문자 env / 소문자 Variable)이 달라
+    get_var()의 단일 키 체인으로는 커버할 수 없으므로 명시적으로 순서대로 시도한다.
+    """
+    v = cfg_int(K_FASTAPI_RELOAD_TIMEOUT_ENV, 0, required=False)
+    if v > 0:
+        return v
+    return cfg_int(K_FASTAPI_RELOAD_TIMEOUT_VAR, DEFAULT_FASTAPI_RELOAD_TIMEOUT, required=False)
+
+
+T_FASTAPI_RELOAD: int = _load_fastapi_reload_timeout()

@@ -9,6 +9,7 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from jinja2 import Template
 
 from ml_code.triton_xcom import xcom_pull_any
+from mlops_lib.core.ids import DP_BUILD_TASK_ID, DP_EXTRACT_TASK_ID
 from .s3 import get_s3_client, parse_s3_uri
 
 logger = LoggingMixin().log
@@ -33,8 +34,9 @@ def store_features(feature_base: str, pipeline_name: str, feature_set: str, meta
     s3 = get_s3_client()
 
     # TaskGroup 적용 시 task_id prefix가 dp.로 붙음
-    BUILD_TASKS = ("dp.build_features", "build_features")
-    EXTRACT_TASKS = ("dp.extract_raw_data", "extract_raw_data")
+    # SSOT(ids.py) 상수를 우선 사용하고, 레거시 flat task_id를 fallback으로 유지한다.
+    BUILD_TASKS = (DP_BUILD_TASK_ID, "build_features")
+    EXTRACT_TASKS = (DP_EXTRACT_TASK_ID, "extract_raw_data")
 
     schema = xcom_pull_any(ti, key="fs_schema", task_ids=BUILD_TASKS)
     schema_hash = xcom_pull_any(ti, key="fs_schema_hash", task_ids=BUILD_TASKS)

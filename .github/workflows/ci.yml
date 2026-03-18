@@ -1,0 +1,51 @@
+name: DAG Integrity
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: DagBag Integrity Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # requirements.txt가 있으면 우선 설치, 없으면 최소 필요 패키지만 설치한다.
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "apache-airflow>=2.10.0,<3.0" pytest
+          fi
+
+      - name: Initialize Airflow DB
+        # DagBag 로딩은 MetadataDB 연결을 필요로 한다.
+        # CI에서는 sqlite + airflow db init으로 충분하다.
+        run: |
+          export AIRFLOW_HOME="${GITHUB_WORKSPACE}/.airflow"
+          airflow db init
+        env:
+          AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
+          AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+      - name: Run DAG integrity tests
+        run: |
+          pytest tests/test_dag_integrity.py -v --tb=short
+        env:
+          AIRFLOW_HOME: ${{ github.workspace }}/.airflow
+          AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
+          AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+          # 테스트 환경에서 Variable 미존재 시 RuntimeError 방지용 더미값
+          MLFLOW_TRACKING_URI: "sqlite:///mlflow.db"
