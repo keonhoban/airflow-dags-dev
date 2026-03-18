@@ -18,6 +18,7 @@ from mlops_lib.core.policy import (
     T_TRITON_LOAD,
     T_TRITON_READY,
     T_TRITON_INFER,
+    triton_opt_config,
 )
 
 log = LoggingMixin().log
@@ -214,7 +215,7 @@ def materialize_repo(*, model: str, deploy_version: int, run_id: str) -> Dict[st
     dst = os.path.join(ver_dir, "model.onnx")
     _write_model_onnx(dst, local, model=str(model), deploy_version=int(deploy_version), run_id=str(run_id))
 
-    cfg_text = build_config_pbtxt(str(model), str(in_name), str(out_prob), str(out_label), n_features, n_classes)
+    cfg_text = build_config_pbtxt(str(model), str(in_name), str(out_prob), str(out_label), n_features, n_classes, opt=triton_opt_config())
     os.makedirs(model_dir, exist_ok=True)
     write_config_atomic(model_dir, cfg_text=cfg_text)
 
@@ -245,4 +246,4 @@ def rebuild_config_for_version(model: str, version: int) -> str:
             f"n_features={n_features} n_classes={n_classes}"
         )
 
-    return build_config_pbtxt(model, str(in_name), str(out_prob), str(out_label), n_features, n_classes)
+    return build_config_pbtxt(model, str(in_name), str(out_prob), str(out_label), n_features, n_classes, opt=triton_opt_config())

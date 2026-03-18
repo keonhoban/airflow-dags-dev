@@ -1,4 +1,55 @@
 # dags/e2e_full.py
+"""
+E2E ML 플랫폼 파이프라인 (e2e_full)
+
+개요
+----
+데이터 추출 → feature 빌드 → 학습 → 배포 → 모니터링 → (필요 시) 자동 롤백까지
+전 과정을 단일 DAG로 오케스트레이션한다.
+비즈니스 로직은 pipelines/, ml_code/, mlops_lib/ 에 위임하고,
+이 파일은 태스크 의존성(DAG 구조)만 정의한다.
+
+전체 플로우 요약
+-----------------
+[dp: 데이터 파이프라인]
+  extract_raw_data → validate_data → build_features → store_features
+    ↓
+[drift_gate: 배포 전 데이터 드리프트 검사 (KS-stat)]
+    ↓
+[train: 모델 학습 + 정확도 평가]
+    ↓
+[branch: 정확도 & 드리프트 결과로 경로 분기]
+    ├─ promotion 경로 (정확도 ≥ threshold, drift 없음)
+    │     register → check_model_ready → deploy → commit_current → fastapi_reload
+    └─ shadow 경로 (정확도 부족 or drift 감지 or train 실패)
+          shadow_start → notify_failure → deploy (commit/reload 생략)
+    ↓
+[observe_post_deploy_metrics: Prometheus 기반 자동 롤백 판정]
+    ↓ (deploy/commit/observe 실패 시)
+[rollback_minimal: current.json 복원 + 실패 버전 격리 + Triton 재로드]
+
+트리거 방식 / schedule
+-----------------------
+schedule=None — 수동 트리거 전용.
+
+이유: 이 DAG의 upstream인 dp_feature_pipeline 완료 시점이
+     데이터 볼륨에 따라 가변적이므로 cron을 고정하면 race condition이 발생한다.
+     운영 환경에서는 dp_feature_pipeline의 on_success_callback 또는
+     Airflow Dataset 트리거로 자동 연결한다 (mlops-infra-gitops 참고).
+
+SLA
+----
+default_args['sla'] = timedelta(hours=E2E_SLA_HOUR).
+트리거 기준으로 SLA_HOUR(기본 1시간) 내에 완료되지 않으면
+sla_miss_callback(alert_sla_miss)이 Slack으로 알림을 보낸다.
+dagrun_timeout(30분)은 강제 종료, SLA는 경보용으로 역할이 다르다.
+
+관련 문서
+----------
+- docs/02_deployment_flow.md : promotion / shadow / rollback 경로 상세
+- docs/04_rollback_policy.md : 롤백 범위와 FastAPI 정책
+- docs/06_runbook.md         : 장애 유형별 운영 절차
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta

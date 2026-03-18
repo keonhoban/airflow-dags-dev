@@ -58,6 +58,28 @@ T_TRITON_READY = 5
 T_TRITON_INFER = 10
 
 # ============================================================
+# Triton 최적화 설정 (SSOT)
+#
+# dynamic_batching:
+#   Triton이 여러 요청을 묶어 한 번에 inference하는 서버사이드 배칭.
+#   max_batch_size > 0 이어야 활성화된다.
+#   preferred_batch_size: 묶을 요청 수 후보 (ex. [8, 16])
+#   max_queue_delay_microseconds: batch 완성을 기다릴 최대 시간 (µs)
+#
+# instance_group:
+#   모델 인스턴스를 GPU 또는 CPU에 몇 개 배치할지 설정.
+#   기본값은 KIND_GPU 1개. CPU 전용 환경은 KIND_CPU로 변경.
+# ============================================================
+
+VAR_TRITON_DYNAMIC_BATCHING_ENABLED = "triton_dynamic_batching_enabled"   # default "false"
+VAR_TRITON_PREFERRED_BATCH_SIZES    = "triton_preferred_batch_sizes"       # default "8,16"
+VAR_TRITON_MAX_QUEUE_DELAY_US       = "triton_max_queue_delay_us"          # default "5000"
+VAR_TRITON_MAX_BATCH_SIZE           = "triton_max_batch_size"              # default "32"
+VAR_TRITON_INSTANCE_GROUP_ENABLED   = "triton_instance_group_enabled"      # default "false"
+VAR_TRITON_INSTANCE_GROUP_KIND      = "triton_instance_group_kind"         # default "KIND_GPU"
+VAR_TRITON_INSTANCE_GROUP_COUNT     = "triton_instance_group_count"        # default "1"
+
+# ============================================================
 # Airflow Variable keys (SSOT)  - 오타 방지용
 # ============================================================
 
@@ -241,3 +263,62 @@ class DriftSettings:
 
 def drift_settings() -> DriftSettings:
     return DriftSettings.load()
+
+
+@dataclass(frozen=True)
+class TritonOptConfig:
+    """
+    Triton 최적화 설정 (Variable 기반 런타임 제어).
+
+    dynamic_batching_enabled:
+        True면 config.pbtxt에 dynamic_batching 블록이 추가된다.
+        False(기본)면 블록 없이 단순 요청 처리.
+
+    instance_group_enabled:
+        True면 config.pbtxt에 instance_group 블록이 추가된다.
+        GPU 환경에서는 True + KIND_GPU 권장.
+        CPU 전용 환경에서는 KIND_CPU로 변경.
+
+    max_batch_size:
+        dynamic_batching 활성화 시 max_batch_size에 이 값이 들어간다.
+        비활성화 시에는 0 (Triton의 unbatched 모드).
+    """
+
+    dynamic_batching_enabled: bool
+    preferred_batch_sizes: list
+    max_queue_delay_us: int
+    max_batch_size: int
+
+    instance_group_enabled: bool
+    instance_group_kind: str
+    instance_group_count: int
+
+    @classmethod
+    def load(cls) -> "TritonOptConfig":
+        dyn_enabled = _to_bool(_v(VAR_TRITON_DYNAMIC_BATCHING_ENABLED, "false"), False)
+
+        raw_sizes = (_v(VAR_TRITON_PREFERRED_BATCH_SIZES, "8,16") or "8,16").strip()
+        preferred = [int(s.strip()) for s in raw_sizes.split(",") if s.strip().isdigit()]
+        if not preferred:
+            preferred = [8, 16]
+
+        delay_us = _to_int(_v(VAR_TRITON_MAX_QUEUE_DELAY_US, "5000"), 5000)
+        max_bs   = _to_int(_v(VAR_TRITON_MAX_BATCH_SIZE, "32"), 32)
+
+        ig_enabled = _to_bool(_v(VAR_TRITON_INSTANCE_GROUP_ENABLED, "false"), False)
+        ig_kind    = (_v(VAR_TRITON_INSTANCE_GROUP_KIND, "KIND_GPU") or "KIND_GPU").strip()
+        ig_count   = _to_int(_v(VAR_TRITON_INSTANCE_GROUP_COUNT, "1"), 1)
+
+        return cls(
+            dynamic_batching_enabled=dyn_enabled,
+            preferred_batch_sizes=preferred,
+            max_queue_delay_us=delay_us,
+            max_batch_size=max_bs,
+            instance_group_enabled=ig_enabled,
+            instance_group_kind=ig_kind,
+            instance_group_count=ig_count,
+        )
+
+
+def triton_opt_config() -> TritonOptConfig:
+    return TritonOptConfig.load()
