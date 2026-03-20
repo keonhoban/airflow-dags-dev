@@ -107,8 +107,12 @@ with DAG(
     # schedule=None: 수동 트리거 전용 DAG.
     # 이유: dp_feature_pipeline(upstream)의 완료 시점이 데이터 볼륨에 따라 가변적이므로
     #       cron으로 고정하면 race condition이 발생할 수 있다.
-    #       운영 환경에서는 dp_feature_pipeline의 on_success_callback 또는
-    #       Airflow Dataset 트리거로 연결한다(mlops-infra-gitops 참고).
+    # TODO(W6): Airflow 2.10+ Dataset API로 dp_feature_pipeline → e2e_full 자동 트리거 구현.
+    #   현재 미구현 사유:
+    #   - 데모/포트폴리오 환경에서 수동 트리거가 디버깅에 유리
+    #   - Dataset 트리거는 dp_feature_pipeline에 outlet 정의 필요 (양 DAG 동시 변경)
+    #   - 운영 적용 시: dp_feature_pipeline에서 Dataset("s3://features/latest") outlet 추가,
+    #     이 DAG의 schedule을 [Dataset("s3://features/latest")]로 변경
     schedule=None,
     catchup=False,
     max_active_runs=E2E_MAX_ACTIVE_RUNS,

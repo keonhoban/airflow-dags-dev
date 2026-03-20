@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from airflow.models import Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from utils.slack_alerts import notify_info, notify_skip, notify_success
@@ -14,6 +13,8 @@ from mlops_lib.core.policy import (
     VAR_LATENCY_P95_THRESHOLD_SEC,
     VAR_OBSERVE_JOB,
     VAR_OBSERVE_NAMESPACE,
+    get_var,
+    _to_float,
 )
 
 from mlops_lib.observability.prometheus_client import (
@@ -45,18 +46,7 @@ Auto rollback policy (SSOT)
 """
 
 
-def _v(key: str, default: Optional[str] = None) -> Optional[str]:
-    try:
-        return Variable.get(key)
-    except Exception:
-        return default
-
-
-def _to_float(raw: Optional[str], default: float) -> float:
-    try:
-        return float(str(raw))
-    except Exception:
-        return default
+_v = get_var
 
 
 @dataclass(frozen=True)
