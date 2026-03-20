@@ -110,7 +110,7 @@ VAR_DP_MIN_ROWS = "dp_min_rows"  # default 50 — 학습 의미가 있는 최소
 # ============================================================
 
 # Prometheus endpoint
-VAR_PROMETHEUS_BASE_URL = "prometheus_base_url"  # e.g. http://prometheus-operated.monitoring.svc.cluster.local:9090
+VAR_PROMETHEUS_BASE_URL = "prometheus_base_url"  # e.g. http://monitoring-dev-kube-promet-prometheus.monitoring-dev:9090
 VAR_PROMETHEUS_BEARER_TOKEN = "prometheus_bearer_token"  # optional
 VAR_PROMETHEUS_VERIFY_TLS = "prometheus_verify_tls"  # true/false
 
