@@ -10,12 +10,13 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from utils.slack_alerts import alert_slack
 from pipelines import full_e2e as p
+from mlops_lib.core.policy import E2E_START_DATE_YMD, E2E_RETRIES, E2E_RETRY_DELAY_MIN
 
 kst = timezone("Asia/Seoul")
 default_args = {
-    "start_date": datetime(2025, 1, 1, tzinfo=kst),
-    "retries": 1,
-    "retry_delay": timedelta(minutes=2),
+    "start_date": datetime(*E2E_START_DATE_YMD, tzinfo=kst),
+    "retries": E2E_RETRIES,
+    "retry_delay": timedelta(minutes=E2E_RETRY_DELAY_MIN),
 }
 
 with DAG(

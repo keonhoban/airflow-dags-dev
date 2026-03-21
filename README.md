@@ -16,60 +16,60 @@
 flowchart TD
     subgraph repo1["📦 airflow-dags-dev (DAG Orchestration)"]
         direction TB
-        DAG["e2e_full DAG\n(Orchestration Only)"]
-        DP["dp TaskGroup\nextract → validate\n→ build → store"]
-        DG["drift_gate\nKS-stat D > 0.20?"]
-        TRAIN["train_and_evaluate\nLogisticRegression + ONNX export"]
-        BRANCH["branch_by_accuracy\n(BranchPythonOperator)"]
-        PROMO["Promotion Path\nregister → sensor → deploy\n→ commit → reload"]
-        SHADOW["Shadow Path\ndeploy only\n(commit/reload skipped)"]
-        OBS["observe_post_deploy_metrics\nPrometheus query"]
-        RB["rollback_minimal\ncurrent.json restore\n+ quarantine + Triton reload"]
+        DAG["e2e_full DAG<br/>(Orchestration Only)"]
+        DP["dp TaskGroup<br/>extract → validate<br/>→ build → store"]
+        DG["drift_gate<br/>KS-stat D > 0.20?"]
+        TRAIN["train_and_evaluate<br/>LogisticRegression + ONNX export"]
+        BRANCH["branch_by_accuracy<br/>(BranchPythonOperator)"]
+        PROMO["Promotion Path<br/>register → sensor → deploy<br/>→ commit → reload"]
+        SHADOW["Shadow Path<br/>deploy only<br/>(commit/reload skipped)"]
+        OBS["observe_post_deploy_metrics<br/>Prometheus query"]
+        RB["rollback_minimal<br/>current.json restore<br/>+ quarantine + Triton reload"]
 
         DAG --> DP
-        DP -->|"feature batch\n(S3 URI via XCom)"| DG
+        DP -->|"feature batch<br/>(S3 URI via XCom)"| DG
         DG -->|"drift OK"| TRAIN
-        DG -->|"drift detected\n→ force shadow"| SHADOW
+        DG -->|"drift detected<br/>→ force shadow"| SHADOW
         TRAIN --> BRANCH
-        BRANCH -->|"accuracy ≥ threshold\n+ drift OK"| PROMO
-        BRANCH -->|"accuracy < threshold\nor train failed"| SHADOW
+        BRANCH -->|"accuracy ≥ threshold<br/>+ drift OK"| PROMO
+        BRANCH -->|"accuracy < threshold<br/>or train failed"| SHADOW
         PROMO -->|"deploy_mode=promote"| OBS
         SHADOW -->|"deploy_mode=shadow"| OBS
-        OBS -->|"metric anomaly\nor SLO breach"| RB
-        PROMO -->|"smoke test fail\nor commit fail"| RB
+        OBS -->|"metric anomaly<br/>or SLO breach"| RB
+        PROMO -->|"smoke test fail<br/>or commit fail"| RB
     end
 
     subgraph repo2["⚙️ mlops-infra-gitops (K8s Infrastructure)"]
         direction TB
-        ARGOCD["ArgoCD\n(GitOps sync)"]
-        TRITON["Triton Inference Server\n(ONNX model serving)"]
-        FASTAPI["FastAPI\n(variant routing\npromotion / shadow)"]
-        PROM["Prometheus\n(metrics scrape)"]
-        K8S["Kubernetes\n(pod lifecycle)"]
+        ARGOCD["ArgoCD<br/>(GitOps sync)"]
+        TRITON["Triton Inference Server<br/>(ONNX model serving)"]
+        FASTAPI["FastAPI<br/>(variant routing<br/>promotion / shadow)"]
+        PROM["Prometheus<br/>(metrics scrape)"]
+        K8S["Kubernetes<br/>(pod lifecycle)"]
 
         ARGOCD -->|"K8s manifest apply"| K8S
         K8S -->|"pod scheduling"| TRITON
         K8S -->|"pod scheduling"| FASTAPI
-        FASTAPI -->|"inference request\n/v2/models/{model}/infer"| TRITON
+        FASTAPI -->|"inference request<br/>/v2/models/{model}/infer"| TRITON
         TRITON -->|"prediction response"| FASTAPI
-        FASTAPI -->|"expose metrics\n/metrics"| PROM
+        FASTAPI -->|"expose metrics<br/>/metrics"| PROM
     end
 
     subgraph stores["🗄️ Shared State"]
-        S3["S3\n(feature store\n+ ONNX artifacts\n+ current.json)"]
-        MLFLOW["MLflow Registry\n(model version\n+ alias + run_id)"]
+        S3["S3<br/>(feature store<br/>+ ONNX artifacts<br/>+ current.json)"]
+        MLFLOW["MLflow Registry<br/>(model version<br/>+ alias + run_id)"]
     end
 
     %% Cross-repo flows
-    DP -->|"store features\n+ reference dist"| S3
-    PROMO -->|"register version\n+ set alias"| MLFLOW
-    PROMO -->|"materialize ONNX\nto Triton repo"| S3
-    SHADOW -->|"materialize ONNX\nto shadow repo"| S3
-    MLFLOW -->|"alias lookup\n(select_by_alias)"| PROMO
-    S3 -->|"ONNX artifact\ndownload"| TRITON
-    PROM -->|"query window\n(60s)"| OBS
-    RB -->|"restore snapshot\nfrom S3"| S3
-    RB -->|"Triton unload\n→ load prev version"| TRITON
+    DP -->|"store features<br/>+ reference dist"| S3
+    PROMO -->|"register version<br/>+ set alias"| MLFLOW
+    PROMO -->|"materialize ONNX<br/>to Triton repo"| S3
+    SHADOW -->|"materialize ONNX<br/>to shadow repo"| S3
+    MLFLOW -->|"alias lookup<br/>(select_by_alias)"| PROMO
+    S3 -->|"ONNX artifact<br/>download"| TRITON
+    PROM -->|"query window<br/>(60s)"| OBS
+    RB -->|"restore snapshot<br/>from S3"| S3
+    RB -->|"Triton unload<br/>→ load prev version"| TRITON
 ```
 
 > **레포 역할 분리**: `airflow-dags-dev`는 파이프라인 로직과 배포 정책을 소유합니다.
@@ -165,14 +165,14 @@ Rollback은 다음만 수행합니다:
 ---
 
 # 3. End-to-End Flow
-```
+```text
 Data → Feature → Train → Branch
-↓
-(Promotion) → Register → Ready Sensor → Deploy → Smoke → Commit → Reload → Observe
-↓
-(Shadow) → Deploy(shadow) → Observe
-↓
-Failure → Minimal Rollback
+  ↓
+  (Promotion) → Register → Ready Sensor → Deploy → Smoke → Commit → Reload → Observe
+  ↓
+  (Shadow) → Deploy(shadow) → Observe
+  ↓
+  Failure → Minimal Rollback
 ```
 
 
@@ -300,7 +300,7 @@ production 버전 디렉토리와 격리됩니다.
 - 태스크 스케줄링 오버헤드 포함 실측: **~35초**
 
 **95초 산출 근거 (observe 이상 탐지 경로):**
-Prometheus 쿼리 window `observe_window_sec=60초` 대기 + rollback_minimal 35초
+Prometheus 에러율 쿼리 window(`win_err=1m`, 60초) 대기 + rollback_minimal 35초
 
 ---
 

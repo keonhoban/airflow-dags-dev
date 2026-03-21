@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 
 import requests
 
+from mlops_lib.core.policy import T_HTTP_DEFAULT
+
 log = logging.getLogger(__name__)
 
 
@@ -16,7 +18,7 @@ def request_json(
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = 10,
+    timeout: int = T_HTTP_DEFAULT,
     ok_status: tuple[int, ...] = (200,),
 ) -> Dict[str, Any]:
     """
@@ -53,7 +55,7 @@ def request_ok(
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = 10,
+    timeout: int = T_HTTP_DEFAULT,
     ok_status: tuple[int, ...] = (200,),
 ) -> None:
     """본문 필요 없을 때 쓰는 표준 호출."""

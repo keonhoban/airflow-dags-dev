@@ -9,6 +9,7 @@ from urllib.error import HTTPError, URLError
 
 from airflow.utils.log.logging_mixin import LoggingMixin
 
+from mlops_lib.core.policy import T_FASTAPI_RELOAD_HTTP, T_FASTAPI_MODELS_HTTP
 from mlops_lib.rollback.types import Ctx
 
 log = LoggingMixin().log
@@ -38,7 +39,7 @@ def _http_json(
         return int(e.code), raw
     except URLError as e:
         return 0, f"URLError: {e}"
-    except Exception as e:
+    except (OSError, ValueError) as e:
         return 0, f"Exception: {e}"
 
 
@@ -56,25 +57,25 @@ def fastapi_reload_service(ctx_like: dict[str, Any] | Ctx) -> dict[str, Any]:
         url,
         payload={"deploy_version": int(ctx.deploy_version)},
         headers=headers,
-        timeout=20,
+        timeout=T_FASTAPI_RELOAD_HTTP,
     )
     if st != 200:
         raise RuntimeError(f"[fastapi] reload(service) failed: status={st} body={raw[:800]}")
 
     try:
         return json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return {"_status": st, "_raw": raw}
 
 
 def _fastapi_models(ctx: Ctx) -> dict[str, Any]:
     url = f"{ctx.fastapi_base_url}/models"
-    st, raw = _http_json("GET", url, payload=None, headers=None, timeout=10)
+    st, raw = _http_json("GET", url, payload=None, headers=None, timeout=T_FASTAPI_MODELS_HTTP)
     if st != 200:
         return {"_status": st, "_raw": raw}
     try:
         return json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return {"_status": st, "_raw": raw}
 
 
@@ -85,7 +86,7 @@ def _get_served_version(models_json: dict[str, Any]) -> Optional[int]:
         if v is None:
             return None
         return int(v)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         return None
 
 

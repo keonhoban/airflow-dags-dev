@@ -25,6 +25,7 @@ from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
 from ml_code.config import get_tracking_uri, get_experiment_name, cfg
+from mlops_lib.core.policy import T_S3_CONNECT, T_S3_READ, TRAIN_MIN_ROWS, TRAIN_MIN_CLASS_SAMPLES
 from mlops_lib.dp.feature_schema import FEATURE_COLS, LABEL_COL
 
 logger = LoggingMixin().log
@@ -49,8 +50,8 @@ class TrainInput:
 
 _S3_CFG = Config(
     retries={"max_attempts": 5, "mode": "standard"},
-    connect_timeout=3,
-    read_timeout=30,
+    connect_timeout=T_S3_CONNECT,
+    read_timeout=T_S3_READ,
 )
 
 
@@ -86,8 +87,8 @@ def _read_parquet_from_s3(feature_uri: str, *, s3_client=None) -> pd.DataFrame:
                 raise TrainSkippableError(f"학습 스킵: feature parquet too large size={size} > max_bytes={max_bytes}")
         except TrainSkippableError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[TRAIN] file size check failed: %s (skipping size validation)", e)
 
     data = obj["Body"].read()
     return pd.read_parquet(io.BytesIO(data))
@@ -105,8 +106,8 @@ def _validate_training_data(df: pd.DataFrame) -> pd.Series:
     if LABEL_COL not in df.columns:
         raise TrainSkippableError("학습 스킵: label 컬럼이 없습니다 (DP build 단계에서 label 생성 필요)")
 
-    if len(df) < 20:
-        raise TrainSkippableError(f"학습 스킵: rows={len(df)} (데모 최소 20 권장, 운영은 200+ 권장)")
+    if len(df) < TRAIN_MIN_ROWS:
+        raise TrainSkippableError(f"학습 스킵: rows={len(df)} (데모 최소 {TRAIN_MIN_ROWS} 권장, 운영은 200+ 권장)")
 
     y = df[LABEL_COL].astype(int)
     uniq = sorted(pd.Series(y).unique().tolist())
@@ -114,7 +115,7 @@ def _validate_training_data(df: pd.DataFrame) -> pd.Series:
         raise TrainSkippableError(f"학습 스킵: 클래스 부족 (unique={uniq})")
 
     vc = y.value_counts()
-    if vc.min() < 3:
+    if vc.min() < TRAIN_MIN_CLASS_SAMPLES:
         raise TrainSkippableError(f"학습 스킵: 클래스 불균형(최소 class count={int(vc.min())}) {vc.to_dict()}")
 
     return y
@@ -236,7 +237,8 @@ def train_model(
 
     try:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-    except Exception:
+    except Exception as e:
+        logger.warning("[TRAIN] stratified split failed (%s), falling back to non-stratified", e)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     with mlflow.start_run() as run:

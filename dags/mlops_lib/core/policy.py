@@ -58,6 +58,16 @@ T_TRITON_READY = 5
 T_TRITON_INFER = 10
 
 # ============================================================
+# FastAPI / HTTP / S3 timeouts (SSOT)
+# ============================================================
+
+T_FASTAPI_RELOAD_HTTP = 20   # POST /variant/{alias}/reload
+T_FASTAPI_MODELS_HTTP = 10   # GET /models
+T_HTTP_DEFAULT = 10           # mlops_lib/infra/http.py 기본 타임아웃
+T_S3_CONNECT = 3              # boto3 S3 connect_timeout
+T_S3_READ = 30                # boto3 S3 read_timeout
+
+# ============================================================
 # Triton 최적화 설정 (SSOT)
 #
 # dynamic_batching:
@@ -106,6 +116,12 @@ VAR_DRIFT_MAX_COLS = "drift_max_columns"  # default 20
 VAR_DP_MIN_ROWS = "dp_min_rows"  # default 50 — 학습 의미가 있는 최소 피처 행 수
 
 # ============================================================
+# Train Validation (SSOT)
+# ============================================================
+TRAIN_MIN_ROWS = 20           # 학습 데이터 최소 행 수 (데모 기준; 운영은 200+ 권장)
+TRAIN_MIN_CLASS_SAMPLES = 3   # stratified split이 가능한 클래스당 최소 샘플 수
+
+# ============================================================
 # Observability / Auto Rollback (SSOT)
 # ============================================================
 
@@ -115,6 +131,8 @@ VAR_PROMETHEUS_BEARER_TOKEN = "prometheus_bearer_token"  # optional
 VAR_PROMETHEUS_VERIFY_TLS = "prometheus_verify_tls"  # true/false
 
 # Observe window params
+# 현재 auto_rollback.py는 RollbackThresholds.win_err/win_latency를 직접 사용.
+# 아래 변수는 향후 Sensor 기반 관측 루프 구현 시 사용 예정.
 VAR_OBSERVE_WINDOW_SEC = "observe_window_sec"  # default 180
 VAR_OBSERVE_STEP_SEC = "observe_step_sec"  # default 15
 VAR_OBSERVE_POKE_INTERVAL_SEC = "observe_poke_interval_sec"  # default 20
