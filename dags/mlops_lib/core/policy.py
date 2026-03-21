@@ -89,6 +89,12 @@ VAR_TRITON_INSTANCE_GROUP_ENABLED   = "triton_instance_group_enabled"      # def
 VAR_TRITON_INSTANCE_GROUP_KIND      = "triton_instance_group_kind"         # default "KIND_GPU"
 VAR_TRITON_INSTANCE_GROUP_COUNT     = "triton_instance_group_count"        # default "1"
 
+# GPU 최적화 (ONNX execution provider / TensorRT)
+VAR_ONNX_EXECUTION_PROVIDER         = "onnx_execution_provider"            # default "CPUExecutionProvider"
+VAR_TENSORRT_ENABLED                 = "tensorrt_enabled"                   # default "false"
+VAR_TENSORRT_PRECISION               = "tensorrt_precision"                 # default "fp16"
+VAR_TENSORRT_MAX_WORKSPACE_SIZE_MB   = "tensorrt_max_workspace_size_mb"    # default "1024"
+
 # ============================================================
 # Airflow Variable keys (SSOT)  - 오타 방지용
 # ============================================================
@@ -311,6 +317,12 @@ class TritonOptConfig:
     instance_group_kind: str
     instance_group_count: int
 
+    # GPU 최적화
+    execution_provider: str
+    tensorrt_enabled: bool
+    tensorrt_precision: str
+    tensorrt_max_workspace_size_mb: int
+
     @classmethod
     def load(cls) -> "TritonOptConfig":
         dyn_enabled = _to_bool(_v(VAR_TRITON_DYNAMIC_BATCHING_ENABLED, "false"), False)
@@ -327,6 +339,11 @@ class TritonOptConfig:
         ig_kind    = (_v(VAR_TRITON_INSTANCE_GROUP_KIND, "KIND_GPU") or "KIND_GPU").strip()
         ig_count   = _to_int(_v(VAR_TRITON_INSTANCE_GROUP_COUNT, "1"), 1)
 
+        exec_provider = (_v(VAR_ONNX_EXECUTION_PROVIDER, "CPUExecutionProvider") or "CPUExecutionProvider").strip()
+        trt_enabled   = _to_bool(_v(VAR_TENSORRT_ENABLED, "false"), False)
+        trt_precision = (_v(VAR_TENSORRT_PRECISION, "fp16") or "fp16").strip()
+        trt_ws_mb     = _to_int(_v(VAR_TENSORRT_MAX_WORKSPACE_SIZE_MB, "1024"), 1024)
+
         return cls(
             dynamic_batching_enabled=dyn_enabled,
             preferred_batch_sizes=preferred,
@@ -335,6 +352,10 @@ class TritonOptConfig:
             instance_group_enabled=ig_enabled,
             instance_group_kind=ig_kind,
             instance_group_count=ig_count,
+            execution_provider=exec_provider,
+            tensorrt_enabled=trt_enabled,
+            tensorrt_precision=trt_precision,
+            tensorrt_max_workspace_size_mb=trt_ws_mb,
         )
 
 

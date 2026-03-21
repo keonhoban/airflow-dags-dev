@@ -64,6 +64,42 @@ instance_group [
 ]"""
 
 
+def _build_execution_accelerators_block(opt: "TritonOptConfig") -> str:
+    """
+    TensorRT execution_accelerators 블록을 생성한다.
+
+    TensorRT 최적화 동작:
+      - ONNX 모델을 TensorRT 엔진으로 JIT 변환 후 GPU에서 실행
+      - precision_mode: fp16 (추론 속도 2배 향상, 정확도 손실 무시 가능)
+                        fp32 (기본, 변환 없음)
+      - max_workspace_size_bytes: TensorRT 엔진 빌드 시 허용할 GPU 메모리 (bytes)
+
+    운영 고려사항:
+      - 첫 추론 시 TensorRT 엔진 빌드로 수십 초 소요 (이후 캐싱)
+      - max_workspace_size가 GPU 메모리를 초과하면 빌드 실패
+      - fp16은 분류 모델에서 정확도 영향 거의 없음 (회귀 모델은 검증 필요)
+    """
+    ws_bytes = opt.tensorrt_max_workspace_size_mb * 1024 * 1024
+    return f"""
+optimization {{
+  execution_accelerators {{
+    gpu_execution_accelerator : [
+      {{
+        name: "tensorrt"
+        parameters {{
+          key: "precision_mode"
+          value: "{opt.tensorrt_precision}"
+        }}
+        parameters {{
+          key: "max_workspace_size_bytes"
+          value: "{ws_bytes}"
+        }}
+      }}
+    ]
+  }}
+}}"""
+
+
 def build_config_pbtxt(
     model: str,
     in_name: str,
@@ -110,6 +146,12 @@ def build_config_pbtxt(
         log.info(
             "[config] instance_group enabled: kind=%s count=%d",
             opt.instance_group_kind, opt.instance_group_count,
+        )
+    if opt is not None and opt.tensorrt_enabled:
+        opt_blocks += _build_execution_accelerators_block(opt)
+        log.info(
+            "[config] TensorRT enabled: precision=%s workspace=%dMB",
+            opt.tensorrt_precision, opt.tensorrt_max_workspace_size_mb,
         )
 
     return f'''name: "{model}"
