@@ -33,11 +33,11 @@ def _make_prom(
 
     def scalar_side_effect(query, default=None):
         q = str(query).lower()
-        if "5xx" in q and "ratio" in q:
+        if 'status=~"5.."' in q and "clamp_min" in q:
             return ratio
-        if "5xx" in q:
+        if 'status=~"5.."' in q:
             return rps
-        if "latency" in q or "histogram" in q:
+        if "histogram_quantile" in q or "latency" in q:
             return p95
         return default
 

@@ -51,3 +51,5 @@ jobs:
           AIRFLOW__CORE__LOAD_EXAMPLES: "False"
           # 테스트 환경에서 Variable 미존재 시 RuntimeError 방지용 더미값
           MLFLOW_TRACKING_URI: "sqlite:///mlflow.db"
+          # dags/ 하위 모듈(mlops_lib 등)을 직접 import하는 단위 테스트 지원
+          PYTHONPATH: ${{ github.workspace }}/dags
