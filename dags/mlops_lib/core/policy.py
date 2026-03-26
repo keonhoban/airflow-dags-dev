@@ -67,6 +67,11 @@ T_HTTP_DEFAULT = 10           # mlops_lib/infra/http.py 기본 타임아웃
 T_S3_CONNECT = 3              # boto3 S3 connect_timeout
 T_S3_READ = 30                # boto3 S3 read_timeout
 
+# Reload retry (trigger_reload.py) — DAG 태스크 내 application-level retry
+RELOAD_RETRY_MAX = 3
+RELOAD_RETRY_BACKOFF_BASE_SEC = 2.0
+RELOAD_RETRY_BACKOFF_CAP_SEC = 8.0
+
 # ============================================================
 # Triton 최적화 설정 (SSOT)
 #
