@@ -1,0 +1,48 @@
+{
+  "_description": "Cross-repo API contract definitions. DAG code assumes these endpoints exist on infra services.",
+  "triton": {
+    "base_path": "/v2",
+    "endpoints": {
+      "model_load": "/v2/repository/models/{model}/load",
+      "model_unload": "/v2/repository/models/{model}/unload",
+      "model_ready": "/v2/models/{model}/ready",
+      "model_info": "/v2/models/{model}",
+      "model_infer": "/v2/models/{model}/infer",
+      "health_live": "/v2/health/live",
+      "health_ready": "/v2/health/ready"
+    },
+    "ports": {
+      "http": 8000,
+      "grpc": 8001,
+      "metrics": 8002
+    },
+    "model_control_mode": "explicit"
+  },
+  "fastapi": {
+    "endpoints": {
+      "reload": "/variant/{alias}/reload",
+      "models": "/models",
+      "health": "/health",
+      "ready": "/ready",
+      "metrics": "/metrics"
+    },
+    "ports": {
+      "http": 8000
+    }
+  },
+  "prometheus": {
+    "endpoints": {
+      "query": "/api/v1/query",
+      "query_range": "/api/v1/query_range"
+    },
+    "metrics": {
+      "http_requests_total": "http_requests_total",
+      "latency_bucket": "http_request_duration_highres_seconds_bucket"
+    }
+  },
+  "mlflow": {
+    "ports": {
+      "http": 5000
+    }
+  }
+}

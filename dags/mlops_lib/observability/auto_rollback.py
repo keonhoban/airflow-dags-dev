@@ -8,6 +8,8 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 
 from utils.slack_alerts import notify_info, notify_skip, notify_success
 
+from airflow.models import Variable
+
 from mlops_lib.core.policy import (
     VAR_ERROR_RATE_THRESHOLD,
     VAR_LATENCY_P95_THRESHOLD_SEC,
@@ -16,6 +18,8 @@ from mlops_lib.core.policy import (
     get_var,
     _to_float,
 )
+
+VAR_OBSERVE_CONSECUTIVE_FAILURES = "observe_consecutive_failures"
 
 from mlops_lib.observability.prometheus_client import (
     PrometheusClient,
@@ -211,10 +215,14 @@ class AutoRollback:
     # ---------------------------
     # Airflow-friendly callables
     # ---------------------------
+
+    OBSERVABILITY_ESCALATION_THRESHOLD = 3
+
     def task_decide(self, **context: Any) -> bool:
         d = self.evaluate()
 
         if d.should_rollback:
+            self._reset_observe_failures()
             notify_info(
                 "AutoRollback: TRIGGERED",
                 reason=d.reason,
@@ -229,15 +237,28 @@ class AutoRollback:
             return True
 
         if d.reason.startswith("OBSERVABILITY_"):
-            notify_skip(
-                "AutoRollback: SKIPPED",
-                reason=d.reason,
-                next_action="Prometheus scrape/ServiceMonitor 라벨/네트워크 확인",
-                job=self.tg.job,
-                namespace=self.tg.namespace,
-            )
+            consecutive = self._increment_observe_failures()
+
+            if consecutive >= self.OBSERVABILITY_ESCALATION_THRESHOLD:
+                notify_info(
+                    "AutoRollback: CRITICAL — observability degraded",
+                    reason=f"{d.reason} (consecutive={consecutive})",
+                    next_action="Prometheus/ServiceMonitor 긴급 점검 필요. 무검증 배포가 반복되고 있음.",
+                    job=self.tg.job,
+                    namespace=self.tg.namespace,
+                    severity="critical",
+                )
+            else:
+                notify_skip(
+                    "AutoRollback: SKIPPED",
+                    reason=d.reason,
+                    next_action="Prometheus scrape/ServiceMonitor 라벨/네트워크 확인",
+                    job=self.tg.job,
+                    namespace=self.tg.namespace,
+                )
             return False
 
+        self._reset_observe_failures()
         notify_success(
             "AutoRollback: OK",
             job=self.tg.job,
@@ -249,3 +270,19 @@ class AutoRollback:
             thresholds=str(d.signals.get("thresholds")),
         )
         return False
+
+    @staticmethod
+    def _increment_observe_failures() -> int:
+        try:
+            prev = int(Variable.get(VAR_OBSERVE_CONSECUTIVE_FAILURES, default_var="0"))
+        except Exception:
+            prev = 0
+        Variable.set(VAR_OBSERVE_CONSECUTIVE_FAILURES, str(prev + 1))
+        return prev + 1
+
+    @staticmethod
+    def _reset_observe_failures() -> None:
+        try:
+            Variable.set(VAR_OBSERVE_CONSECUTIVE_FAILURES, "0")
+        except Exception:
+            pass

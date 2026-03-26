@@ -42,9 +42,9 @@ jobs:
           AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
           AIRFLOW__CORE__LOAD_EXAMPLES: "False"
 
-      - name: Run DAG integrity tests
+      - name: Run all tests
         run: |
-          pytest tests/test_dag_integrity.py -v --tb=short
+          pytest tests/ -v --tb=short
         env:
           AIRFLOW_HOME: ${{ github.workspace }}/.airflow
           AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags

@@ -30,10 +30,7 @@ class DriftDecision:
 
 
 def _ks_stat(x: np.ndarray, y: np.ndarray) -> float:
-    """
-    Two-sample KS statistic (D).
-    - p-value는 외부 의존성/환경차가 생길 수 있어, 제출/운영 최소 스택에서는 D만 사용
-    """
+    """Two-sample KS statistic (D)."""
     x = np.sort(x)
     y = np.sort(y)
     n = x.size
@@ -45,6 +42,17 @@ def _ks_stat(x: np.ndarray, y: np.ndarray) -> float:
     cdf_x = np.searchsorted(x, data_all, side="right") / n
     cdf_y = np.searchsorted(y, data_all, side="right") / m
     return float(np.max(np.abs(cdf_x - cdf_y)))
+
+
+def _ks_pvalue(d: float, n: int, m: int) -> float:
+    """
+    Asymptotic p-value for two-sample KS test (Kolmogorov distribution).
+    p ≈ 2 * exp(-2 * D^2 * n*m/(n+m)). No scipy needed. Accurate for n,m >= 50.
+    """
+    if n == 0 or m == 0 or d <= 0.0:
+        return 1.0
+    en = float(n * m) / float(n + m)
+    return float(min(1.0, 2.0 * np.exp(-2.0 * d * d * en)))
 
 
 def _pick_numeric_columns(df: pd.DataFrame, max_cols: int) -> List[str]:
@@ -116,6 +124,7 @@ def drift_gate(**context: Any) -> None:
 
     worst_col = "-"
     worst_stat = 0.0
+    worst_pvalue = 1.0
     stats: Dict[str, float] = {}
 
     for c in cols:
@@ -125,16 +134,18 @@ def drift_gate(**context: Any) -> None:
             continue
 
         d_stat = _ks_stat(x.astype(float), y.astype(float))
+        p_val = _ks_pvalue(d_stat, x.size, y.size)
         stats[c] = d_stat
         if d_stat > worst_stat:
             worst_stat = d_stat
             worst_col = c
+            worst_pvalue = p_val
 
     block = bool(worst_stat > ks_th)
     reason = (
-        f"DRIFT_BLOCK: worst_col={worst_col} ks={worst_stat:.4f} (> {ks_th})"
+        f"DRIFT_BLOCK: worst_col={worst_col} ks={worst_stat:.4f} p={worst_pvalue:.2e} (> {ks_th})"
         if block
-        else f"DRIFT_OK: worst_col={worst_col} ks={worst_stat:.4f} (<= {ks_th})"
+        else f"DRIFT_OK: worst_col={worst_col} ks={worst_stat:.4f} p={worst_pvalue:.2e} (<= {ks_th})"
     )
 
     ti.xcom_push(key=XCOM_DRIFT_BLOCK_PROMOTION, value=block)

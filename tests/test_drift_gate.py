@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mlops_lib.quality.drift_gate import _ks_stat, _pick_numeric_columns
+from mlops_lib.quality.drift_gate import _ks_stat, _ks_pvalue, _pick_numeric_columns
 
 
 class TestKsStat:
@@ -59,6 +59,37 @@ class TestKsStat:
         x = np.random.normal(0, 1, 100)
         y = np.random.normal(1, 1, 100)
         assert _ks_stat(x, y) == pytest.approx(_ks_stat(y, x))
+
+
+class TestKsPvalue:
+    """_ks_pvalue: asymptotic p-value approximation."""
+
+    def test_identical_distributions_high_pvalue(self):
+        np.random.seed(42)
+        x = np.random.normal(0, 1, 200)
+        y = np.random.normal(0, 1, 200)
+        d = _ks_stat(x, y)
+        p = _ks_pvalue(d, len(x), len(y))
+        assert p > 0.05
+
+    def test_shifted_distributions_low_pvalue(self):
+        np.random.seed(42)
+        x = np.random.normal(0, 1, 500)
+        y = np.random.normal(2, 1, 500)
+        d = _ks_stat(x, y)
+        p = _ks_pvalue(d, len(x), len(y))
+        assert p < 0.001
+
+    def test_empty_arrays_return_one(self):
+        assert _ks_pvalue(0.5, 0, 100) == 1.0
+        assert _ks_pvalue(0.5, 100, 0) == 1.0
+
+    def test_zero_d_returns_one(self):
+        assert _ks_pvalue(0.0, 100, 100) == 1.0
+
+    def test_pvalue_bounded_zero_one(self):
+        p = _ks_pvalue(0.99, 1000, 1000)
+        assert 0.0 <= p <= 1.0
 
 
 class TestPickNumericColumns:
