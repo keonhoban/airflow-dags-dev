@@ -155,6 +155,12 @@ VAR_OBSERVE_NAMESPACE = "observe_namespace"  # e.g. fastapi-dev / fastapi-prod
 VAR_PROMQL_ERROR_RATE = "promql_error_rate"
 VAR_PROMQL_LATENCY_P95 = "promql_latency_p95"
 
+# Prometheus metric names (SSOT)
+# prometheus-fastapi-instrumentator v6.x 기본 메트릭명.
+# 변경 시 infra 레포의 PrometheusRule alert도 함께 수정할 것.
+METRIC_HTTP_REQUESTS_TOTAL = "http_requests_total"
+METRIC_LATENCY_BUCKET = "http_request_duration_highres_seconds_bucket"
+
 
 def _non_empty(v: Any) -> Optional[str]:
     """빈 문자열과 None을 동일하게 처리. str.strip() 후 비어있으면 None 반환."""

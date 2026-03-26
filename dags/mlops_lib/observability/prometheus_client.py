@@ -11,6 +11,8 @@ import requests
 from airflow.models import Variable
 
 from mlops_lib.core.policy import (
+    METRIC_HTTP_REQUESTS_TOTAL,
+    METRIC_LATENCY_BUCKET,
     VAR_PROMETHEUS_BASE_URL,
     VAR_PROMETHEUS_BEARER_TOKEN,
     VAR_PROMETHEUS_VERIFY_TLS,
@@ -193,18 +195,18 @@ class PrometheusClient:
 # ---------------------------
 def q_fastapi_5xx_ratio(*, job: str, namespace: str, window: str = "1m") -> str:
     return (
-        f'sum(rate(http_requests_total{{job="{job}",namespace="{namespace}",status=~"5.."}}[{window}]))'
-        f' / clamp_min(sum(rate(http_requests_total{{job="{job}",namespace="{namespace}"}}[{window}])), 1)'
+        f'sum(rate({METRIC_HTTP_REQUESTS_TOTAL}{{job="{job}",namespace="{namespace}",status=~"5.."}}[{window}]))'
+        f' / clamp_min(sum(rate({METRIC_HTTP_REQUESTS_TOTAL}{{job="{job}",namespace="{namespace}"}}[{window}])), 1)'
     )
 
 
 def q_fastapi_5xx_rps(*, job: str, namespace: str, window: str = "1m") -> str:
-    return f'sum(rate(http_requests_total{{job="{job}",namespace="{namespace}",status=~"5.."}}[{window}]))'
+    return f'sum(rate({METRIC_HTTP_REQUESTS_TOTAL}{{job="{job}",namespace="{namespace}",status=~"5.."}}[{window}]))'
 
 
 def q_fastapi_p95_latency_seconds(*, job: str, namespace: str, window: str = "5m") -> str:
     return (
         f'histogram_quantile(0.95, '
-        f'sum(rate(http_request_duration_highr_seconds_bucket{{job="{job}",namespace="{namespace}"}}[{window}])) by (le)'
+        f'sum(rate({METRIC_LATENCY_BUCKET}{{job="{job}",namespace="{namespace}"}}[{window}])) by (le)'
         f')'
     )
