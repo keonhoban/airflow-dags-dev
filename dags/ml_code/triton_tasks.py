@@ -234,7 +234,33 @@ def rollback_minimal(ti, **_) -> None:
         triton_unload(str(model))
         triton_load(str(model))
     except Exception as e:
-        log.warning("[ROLLBACK] reload failed: %s", e)
+        log.warning("[ROLLBACK] triton reload failed: %s", e)
+
+    # 4) FastAPI reload (best-effort — 실패해도 롤백 자체는 성공으로 처리)
+    from mlops_lib.core.policy import ROLLBACK_INCLUDES_FASTAPI_RELOAD
+    if ROLLBACK_INCLUDES_FASTAPI_RELOAD and str(deploy_mode) != "shadow":
+        try:
+            from mlops_lib.infra.http import request_raw
+            from mlops_lib.core.policy import T_FASTAPI_RELOAD_HTTP
+            alias = xcom_pull_any(ti, key=K_ALIAS, task_ids=mat_task_ids())
+            prev_version = prev.get("active_version") if isinstance(prev, dict) else None
+            if alias and prev_version is not None:
+                fastapi_url = cfg("fastapi_base_url", required=False) or ""
+                fastapi_token = cfg("fastapi_reload_token", required=False) or ""
+                if fastapi_url:
+                    url = f"{fastapi_url}/variant/{alias}/reload"
+                    st, raw = request_raw(
+                        "POST", url,
+                        payload={"deploy_version": int(prev_version)},
+                        headers={"x-token": fastapi_token},
+                        timeout=T_FASTAPI_RELOAD_HTTP,
+                    )
+                    if st == 200:
+                        log.warning("[ROLLBACK] fastapi reload ok (version=%s)", prev_version)
+                    else:
+                        log.warning("[ROLLBACK] fastapi reload status=%s body=%s", st, raw[:200])
+        except Exception as e:
+            log.warning("[ROLLBACK] fastapi reload failed (best-effort): %s", e)
 
 
 def rollback_manual(model: str | None = None, deploy_version: int | None = None) -> None:

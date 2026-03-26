@@ -44,9 +44,9 @@ MODEL_READY_POKE_INTERVAL_SEC = 10
 MODEL_READY_TIMEOUT_SEC = 180
 MODEL_READY_MODE = "reschedule"
 
-# ✅ 정책: FastAPI reload 실패는 자동 롤백하지 않음
-# (model repo SSOT(current.json / config.pbtxt)를 되돌리는 건 위험)
-ROLLBACK_ON_FASTAPI_RELOAD_FAILURE = False
+# ✅ 정책: 롤백 시 FastAPI reload를 best-effort로 시도함
+# 실패해도 롤백 자체는 성공으로 처리 (FastAPI reload 실패가 롤백을 중단시키지 않음)
+ROLLBACK_INCLUDES_FASTAPI_RELOAD = True
 
 # ============================================================
 # Triton timeouts (SSOT)
@@ -98,6 +98,15 @@ VAR_TENSORRT_MAX_WORKSPACE_SIZE_MB   = "tensorrt_max_workspace_size_mb"    # def
 # ============================================================
 # Airflow Variable keys (SSOT)  - 오타 방지용
 # ============================================================
+
+# ============================================================
+# Canary 배포 정책 (SSOT)
+# ============================================================
+# accuracy가 canary 임계값 이상이고 promote 임계값 미만이면 canary 경로
+VAR_CANARY_ACCURACY_THRESHOLD = "canary_accuracy_threshold"   # default: accuracy_threshold와 동일
+VAR_CANARY_PROMOTE_THRESHOLD = "canary_promote_threshold"     # default: accuracy_threshold + 0.05
+VAR_CANARY_TRAFFIC_PCT = "canary_traffic_pct"                 # default: 10 (%)
+VAR_CANARY_OBSERVE_WINDOW_SEC = "canary_observe_window_sec"   # default: 900 (15분)
 
 VAR_TRITON_ENV = "triton_env"
 VAR_ACCURACY_THRESHOLD = "accuracy_threshold"
