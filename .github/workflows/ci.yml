@@ -5,6 +5,8 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  schedule:
+    - cron: '0 9 * * 1'  # 매주 월요일 09:00 UTC — 의존성/스키마 드리프트 감지
 
 jobs:
   test:
