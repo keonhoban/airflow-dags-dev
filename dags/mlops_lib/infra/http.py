@@ -48,6 +48,33 @@ def request_json(
         return {"raw": (r.text or "")[:2000]}
 
 
+def request_raw(
+    method: str,
+    url: str,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = T_HTTP_DEFAULT,
+) -> tuple[int, str]:
+    """
+    Low-level HTTP 호출 — (status_code, raw_body) 튜플 반환.
+
+    롤백 모듈 등 상태 코드 분기가 필요한 곳에서 사용.
+    예외를 던지지 않고 status=0으로 네트워크 오류를 표현한다.
+    """
+    try:
+        r = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        return r.status_code, r.text or ""
+    except requests.RequestException as e:
+        return 0, f"RequestError: {e}"
+
+
 def request_ok(
     method: str,
     url: str,

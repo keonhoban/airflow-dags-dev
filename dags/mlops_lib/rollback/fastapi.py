@@ -3,44 +3,15 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Optional, Tuple
-from urllib import request as urlrequest
-from urllib.error import HTTPError, URLError
+from typing import Any, Optional
 
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from mlops_lib.core.policy import T_FASTAPI_RELOAD_HTTP, T_FASTAPI_MODELS_HTTP
+from mlops_lib.infra.http import request_raw
 from mlops_lib.rollback.types import Ctx
 
 log = LoggingMixin().log
-
-
-def _http_json(
-    method: str,
-    url: str,
-    payload: Optional[dict[str, Any]] = None,
-    headers: Optional[dict[str, str]] = None,
-    timeout: int = 10,
-) -> Tuple[int, str]:
-    body = None
-    hdrs = {"Content-Type": "application/json"}
-    if headers:
-        hdrs.update(headers)
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-
-    req = urlrequest.Request(url, data=body, method=method, headers=hdrs)
-    try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return resp.status, raw
-    except HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        return int(e.code), raw
-    except URLError as e:
-        return 0, f"URLError: {e}"
-    except (OSError, ValueError) as e:
-        return 0, f"Exception: {e}"
 
 
 def _ctx(ctx_like: dict[str, Any] | Ctx) -> Ctx:
@@ -52,7 +23,7 @@ def fastapi_reload_service(ctx_like: dict[str, Any] | Ctx) -> dict[str, Any]:
     headers = {"x-token": ctx.fastapi_token}
     url = f"{ctx.fastapi_base_url}/variant/{ctx.alias}/reload"
 
-    st, raw = _http_json(
+    st, raw = request_raw(
         "POST",
         url,
         payload={"deploy_version": int(ctx.deploy_version)},
@@ -70,7 +41,7 @@ def fastapi_reload_service(ctx_like: dict[str, Any] | Ctx) -> dict[str, Any]:
 
 def _fastapi_models(ctx: Ctx) -> dict[str, Any]:
     url = f"{ctx.fastapi_base_url}/models"
-    st, raw = _http_json("GET", url, payload=None, headers=None, timeout=T_FASTAPI_MODELS_HTTP)
+    st, raw = request_raw("GET", url, timeout=T_FASTAPI_MODELS_HTTP)
     if st != 200:
         return {"_status": st, "_raw": raw}
     try:
