@@ -26,7 +26,8 @@ K_EXPERIMENT_NAME = "experiment_name"
 # -----------------------
 K_FASTAPI_RELOAD_TIMEOUT_ENV = "FASTAPI_RELOAD_TIMEOUT"
 K_FASTAPI_RELOAD_TIMEOUT_VAR = "fastapi_reload_timeout"
-# NOTE: 일반 경로(trigger_reload.py)는 기본 10s — retry 가능하므로 짧게 설정.
+# NOTE: 일반 경로(trigger_reload.py)는 기본 10s — 최대 3회 retry(policy.RELOAD_RETRY_MAX)
+#       총 최대 소요 ~54s (10s×4 + backoff ~14s). DAG retry 예산(2분 간격) 내 수용.
 #       롤백 경로(rollback/fastapi.py)는 policy.T_FASTAPI_RELOAD_HTTP=20s —
 #       단일 시도(retry 없음)이므로 여유 있게 설정. 의도적 차이.
 DEFAULT_FASTAPI_RELOAD_TIMEOUT = 10
