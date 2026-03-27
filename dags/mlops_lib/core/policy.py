@@ -273,8 +273,10 @@ class Settings:
         th = _to_float(_v(VAR_ACCURACY_THRESHOLD, "0.60"), 0.60)
 
         canary_acc_th = _to_float(_v(VAR_CANARY_ACCURACY_THRESHOLD, str(th)), th)
+        _default_promote = round(th + 0.05, 4)
         canary_promote_th = _to_float(
-            _v(VAR_CANARY_PROMOTE_THRESHOLD, str(th + 0.05)), th + 0.05,
+            _v(VAR_CANARY_PROMOTE_THRESHOLD, str(_default_promote)),
+            _default_promote,
         )
         canary_pct = _to_int(_v(VAR_CANARY_TRAFFIC_PCT, "10"), 10)
 
