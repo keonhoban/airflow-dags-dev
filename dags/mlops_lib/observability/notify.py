@@ -43,6 +43,22 @@ def notify_branch_promotion(*, env: str, accuracy: float, threshold: float) -> N
     )
 
 
+def notify_branch_canary(
+    *,
+    env: str,
+    accuracy: float,
+    threshold: float,
+    promote_threshold: float,
+) -> None:
+    notify_info(
+        "Branch: canary",
+        env=env,
+        accuracy=f"{float(accuracy):.4f}",
+        canary_threshold=str(threshold),
+        promote_threshold=str(promote_threshold),
+    )
+
+
 def notify_branch_shadow(
     *,
     env: str,

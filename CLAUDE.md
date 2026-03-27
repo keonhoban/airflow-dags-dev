@@ -54,8 +54,10 @@ Apache Airflow 기반의 **프로덕션급 E2E ML 서빙 플랫폼**입니다. �
 
 ```
 학습 → branch_by_accuracy (BranchPythonOperator)
-├─ accuracy ≥ 임계값 AND drift 정상 → Promotion 경로
+├─ accuracy ≥ promote_threshold AND drift 정상 → Promotion 경로
 │   register → sensor → deploy → commit_current_json → reload → observe
+├─ canary_threshold ≤ accuracy < promote_threshold AND drift 정상 → Canary 경로
+│   Promotion과 동일 DAG 경로, XCOM_CANARY_TRAFFIC_PCT로 구분
 └─ 그 외 → Shadow 경로 (deploy만, commit/reload 없음)
     사유: drift_detected | below_threshold | train_skipped | accuracy_invalid
 ```

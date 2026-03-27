@@ -258,6 +258,9 @@ class Settings:
 
     env: str
     accuracy_threshold: float
+    canary_accuracy_threshold: float
+    canary_promote_threshold: float
+    canary_traffic_pct: int
     logreg_c: float
     logreg_max_iter: int
     model_name: str
@@ -268,6 +271,12 @@ class Settings:
     def load(cls) -> "Settings":
         env = (_v(VAR_TRITON_ENV, "dev") or "dev").strip()
         th = _to_float(_v(VAR_ACCURACY_THRESHOLD, "0.60"), 0.60)
+
+        canary_acc_th = _to_float(_v(VAR_CANARY_ACCURACY_THRESHOLD, str(th)), th)
+        canary_promote_th = _to_float(
+            _v(VAR_CANARY_PROMOTE_THRESHOLD, str(th + 0.05)), th + 0.05,
+        )
+        canary_pct = _to_int(_v(VAR_CANARY_TRAFFIC_PCT, "10"), 10)
 
         c = _to_float(_v(VAR_LOGREG_C, "1.0"), 1.0)
         it = _to_int(_v(VAR_LOGREG_MAX_ITER, "200"), 200)
@@ -283,6 +292,9 @@ class Settings:
         return cls(
             env=env,
             accuracy_threshold=th,
+            canary_accuracy_threshold=canary_acc_th,
+            canary_promote_threshold=canary_promote_th,
+            canary_traffic_pct=canary_pct,
             logreg_c=c,
             logreg_max_iter=it,
             model_name=model_name,
