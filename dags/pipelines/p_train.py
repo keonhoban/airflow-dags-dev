@@ -104,6 +104,7 @@ def branch_by_accuracy(**context: Any) -> str:
     # 0) Drift gate 우선 (Pre-deploy quality gate)
     drift_block = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_BLOCK_PROMOTION)
     if str(drift_block).strip().lower() in ("1", "true", "yes", "y", "on"):
+        # ✅ branch에서 SSOT로 남김
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_DRIFT_DETECTED)
 
         drift_reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"
