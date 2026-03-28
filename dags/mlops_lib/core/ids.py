@@ -49,7 +49,7 @@ BRANCH_TASK_ID = "check_result"
 REGISTER_TASK_ID = "register_model_task"
 
 PROMOTION_START_TASK_ID = "promotion_start"
-CANARY_START_TASK_ID = "canary_start"
+
 SHADOW_START_TASK_ID = "shadow_start"
 NOTIFY_FAILURE_TASK_ID = "notify_failure"
 
@@ -104,11 +104,9 @@ SHADOW_REASON_DRIFT_DETECTED = "drift_detected"
 
 # --- Deploy mode ---
 DEPLOY_MODE_PROMOTE = "promote"
-DEPLOY_MODE_CANARY = "canary"
+
 DEPLOY_MODE_SHADOW = "shadow"
 
-# --- XCom: Canary ---
-XCOM_CANARY_TRAFFIC_PCT = "canary_traffic_pct"
 
 # ============================================================
 # Triton XCom keys (SSOT)
@@ -159,7 +157,7 @@ class E2E:
     BRANCH = BRANCH_TASK_ID
     REGISTER = REGISTER_TASK_ID
     PROMOTION_START = PROMOTION_START_TASK_ID
-    CANARY_START = CANARY_START_TASK_ID
+
     SHADOW_START = SHADOW_START_TASK_ID
     NOTIFY_FAILURE = NOTIFY_FAILURE_TASK_ID
     SENSOR_MODEL_READY = SENSOR_MODEL_READY_TASK_ID

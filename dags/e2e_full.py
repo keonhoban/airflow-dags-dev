@@ -19,11 +19,9 @@ E2E ML 플랫폼 파이프라인 (e2e_full)
 [train: 모델 학습 + 정확도 평가]
     ↓
 [branch: 정확도 & 드리프트 결과로 경로 분기]
-    ├─ promotion 경로 (정확도 ≥ promote_threshold, drift 없음)
+    ├─ promotion 경로 (정확도 ≥ accuracy_threshold, drift 없음)
     │     register → check_model_ready → deploy → commit_current → fastapi_reload
-    ├─ canary 경로 (canary_threshold ≤ 정확도 < promote_threshold, drift 없음)
-    │     promotion과 동일 경로, XCOM_CANARY_TRAFFIC_PCT로 구분
-    └─ shadow 경로 (정확도 < canary_threshold or drift 감지 or train 실패)
+    └─ shadow 경로 (정확도 < accuracy_threshold or drift 감지 or train 실패)
           shadow_start → notify_failure → deploy (commit/reload 생략)
     ↓
 [observe_post_deploy_metrics: Prometheus 기반 자동 롤백 판정]
@@ -149,14 +147,14 @@ with DAG(
 
     branch = BranchPythonOperator(
         task_id=I.BRANCH,
-        python_callable=p.branch_by_accuracy,  # -> I.REGISTER (promotion/canary) OR I.SHADOW_START
+        python_callable=p.branch_by_accuracy,  # -> I.REGISTER (promotion) | I.SHADOW_START
     )
 
     promotion_start = EmptyOperator(task_id=I.PROMOTION_START)
     shadow_start = EmptyOperator(task_id=I.SHADOW_START)
 
     # =========================================================
-    # 3) Promotion / Canary path
+    # 3) Promotion path
     # =========================================================
     register = mk_py(I.REGISTER, p.register_model_task)
 
@@ -203,7 +201,7 @@ with DAG(
     # =========================================================
     # 6) FastAPI reload
     # 정책:
-    # - promotion/canary: 실행
+    # - promotion: 실행
     # - shadow: p_reload.py 내부 정책으로 skip
     # =========================================================
     fastapi_reload = mk_py(I.FASTAPI_RELOAD, p.fastapi_reload_task)
@@ -239,7 +237,7 @@ with DAG(
     shadow_start >> deploy
 
     # 운영형 순서:
-    # - promotion/canary: deploy -> commit -> reload -> observe
+    # - promotion: deploy -> commit -> reload -> observe
     # - shadow: deploy -> commit -> (reload skipped) -> observe
     deploy >> commit_current >> fastapi_reload >> observe_metrics
 
@@ -247,7 +245,7 @@ with DAG(
     [deploy, commit_current, observe_metrics] >> rollback_minimal
 
     # summarize fan-in: 실제 terminal 태스크만 연결한다.
-    # - fastapi_reload  : promotion/canary의 마지막 I/O 태스크 (shadow는 skip됨)
+    # - fastapi_reload  : promotion의 마지막 I/O 태스크 (shadow는 skip됨)
     # - observe_metrics : 파이프라인 최종 품질 판정
     # - rollback_minimal: 장애 복구 경로의 끝
     # - notify_failure  : shadow 분기 알림의 끝

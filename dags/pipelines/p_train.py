@@ -23,7 +23,7 @@ from mlops_lib.core.ids import (
     XCOM_SHADOW_REASON,
     XCOM_DRIFT_BLOCK_PROMOTION,
     XCOM_DRIFT_REASON,
-    XCOM_CANARY_TRAFFIC_PCT,
+
     # shadow reason
     SHADOW_REASON_TRAIN_SKIPPED,
     SHADOW_REASON_ACCURACY_INVALID,
@@ -37,7 +37,7 @@ from mlops_lib.core.policy import Settings
 from mlops_lib.observability.notify import (
     notify_train_completed,
     notify_branch_promotion,
-    notify_branch_canary,
+
     notify_branch_shadow,
 )
 
@@ -91,12 +91,8 @@ def train_and_evaluate(**context: Any) -> None:
 def branch_by_accuracy(**context: Any) -> str:
     """
     Returns task_id to follow:
-    - REGISTER_TASK_ID (promotion: acc >= promote_threshold)
-    - REGISTER_TASK_ID (canary: canary_threshold <= acc < promote_threshold)
-    - SHADOW_START_TASK_ID (shadow)
-
-    Canary와 Promotion은 동일한 DAG 경로(register → deploy)를 사용하며,
-    XCOM_CANARY_TRAFFIC_PCT 유무로 구분한다.
+    - REGISTER_TASK_ID (promotion: acc >= accuracy_threshold, no drift)
+    - SHADOW_START_TASK_ID (shadow: acc < threshold, drift, or error)
     """
     s = Settings.load()
     ti = context["ti"]
@@ -104,7 +100,6 @@ def branch_by_accuracy(**context: Any) -> str:
     # 0) Drift gate 우선 (Pre-deploy quality gate)
     drift_block = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_BLOCK_PROMOTION)
     if str(drift_block).strip().lower() in ("1", "true", "yes", "y", "on"):
-        # ✅ branch에서 SSOT로 남김
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_DRIFT_DETECTED)
 
         drift_reason = ti.xcom_pull(task_ids=DRIFT_GATE_TASK_ID, key=XCOM_DRIFT_REASON) or "DRIFT_BLOCK"
@@ -116,38 +111,27 @@ def branch_by_accuracy(**context: Any) -> str:
 
     if acc is None:
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_TRAIN_SKIPPED)
-        notify_branch_shadow(env=s.env, reason=SHADOW_REASON_TRAIN_SKIPPED, threshold=s.canary_accuracy_threshold)
+        notify_branch_shadow(env=s.env, reason=SHADOW_REASON_TRAIN_SKIPPED, threshold=s.accuracy_threshold)
         return SHADOW_START_TASK_ID
 
     try:
         acc_f = float(acc)
     except Exception:
         ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_ACCURACY_INVALID)
-        notify_branch_shadow(env=s.env, reason=SHADOW_REASON_ACCURACY_INVALID, threshold=s.canary_accuracy_threshold)
+        notify_branch_shadow(env=s.env, reason=SHADOW_REASON_ACCURACY_INVALID, threshold=s.accuracy_threshold)
         return SHADOW_START_TASK_ID
 
-    # 1) Promotion: accuracy >= promote_threshold
-    if acc_f >= s.canary_promote_threshold:
-        notify_branch_promotion(env=s.env, accuracy=acc_f, threshold=s.canary_promote_threshold)
+    # 1) Promotion: accuracy >= threshold
+    if acc_f >= s.accuracy_threshold:
+        notify_branch_promotion(env=s.env, accuracy=acc_f, threshold=s.accuracy_threshold)
         return REGISTER_TASK_ID
 
-    # 2) Canary: canary_threshold <= accuracy < promote_threshold
-    if acc_f >= s.canary_accuracy_threshold:
-        ti.xcom_push(key=XCOM_CANARY_TRAFFIC_PCT, value=s.canary_traffic_pct)
-        notify_branch_canary(
-            env=s.env,
-            accuracy=acc_f,
-            threshold=s.canary_accuracy_threshold,
-            promote_threshold=s.canary_promote_threshold,
-        )
-        return REGISTER_TASK_ID
-
-    # 3) Shadow: accuracy < canary_threshold
+    # 2) Shadow: accuracy < threshold
     ti.xcom_push(key=XCOM_SHADOW_REASON, value=SHADOW_REASON_BELOW_THRESHOLD)
     notify_branch_shadow(
         env=s.env,
         reason=SHADOW_REASON_BELOW_THRESHOLD,
-        threshold=s.canary_accuracy_threshold,
+        threshold=s.accuracy_threshold,
         accuracy=acc_f,
     )
     return SHADOW_START_TASK_ID

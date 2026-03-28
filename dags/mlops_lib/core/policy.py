@@ -104,14 +104,6 @@ VAR_TENSORRT_MAX_WORKSPACE_SIZE_MB   = "tensorrt_max_workspace_size_mb"    # def
 # Airflow Variable keys (SSOT)  - 오타 방지용
 # ============================================================
 
-# ============================================================
-# Canary 배포 정책 (SSOT)
-# ============================================================
-# accuracy가 canary 임계값 이상이고 promote 임계값 미만이면 canary 경로
-VAR_CANARY_ACCURACY_THRESHOLD = "canary_accuracy_threshold"   # default: accuracy_threshold와 동일
-VAR_CANARY_PROMOTE_THRESHOLD = "canary_promote_threshold"     # default: accuracy_threshold + 0.05
-VAR_CANARY_TRAFFIC_PCT = "canary_traffic_pct"                 # default: 10 (%)
-VAR_CANARY_OBSERVE_WINDOW_SEC = "canary_observe_window_sec"   # default: 900 (15분)
 
 VAR_TRITON_ENV = "triton_env"
 VAR_ACCURACY_THRESHOLD = "accuracy_threshold"
@@ -258,9 +250,6 @@ class Settings:
 
     env: str
     accuracy_threshold: float
-    canary_accuracy_threshold: float
-    canary_promote_threshold: float
-    canary_traffic_pct: int
     logreg_c: float
     logreg_max_iter: int
     model_name: str
@@ -271,14 +260,6 @@ class Settings:
     def load(cls) -> "Settings":
         env = (_v(VAR_TRITON_ENV, "dev") or "dev").strip()
         th = _to_float(_v(VAR_ACCURACY_THRESHOLD, "0.60"), 0.60)
-
-        canary_acc_th = _to_float(_v(VAR_CANARY_ACCURACY_THRESHOLD, str(th)), th)
-        _default_promote = round(th + 0.05, 4)
-        canary_promote_th = _to_float(
-            _v(VAR_CANARY_PROMOTE_THRESHOLD, str(_default_promote)),
-            _default_promote,
-        )
-        canary_pct = _to_int(_v(VAR_CANARY_TRAFFIC_PCT, "10"), 10)
 
         c = _to_float(_v(VAR_LOGREG_C, "1.0"), 1.0)
         it = _to_int(_v(VAR_LOGREG_MAX_ITER, "200"), 200)
@@ -294,9 +275,6 @@ class Settings:
         return cls(
             env=env,
             accuracy_threshold=th,
-            canary_accuracy_threshold=canary_acc_th,
-            canary_promote_threshold=canary_promote_th,
-            canary_traffic_pct=canary_pct,
             logreg_c=c,
             logreg_max_iter=it,
             model_name=model_name,
